@@ -1,0 +1,42 @@
+[workspace]
+authors = ["Kevin Keller <kellerkev@gmail.com>"]
+channels = ["conda-forge"]
+name = "zettelkasten-memory"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[dependencies]
+python = ">=3.10,<4"
+pip = "*"
+numpy = ">=1.21.0"
+scikit-learn = ">=1.0.0"
+
+[pypi-dependencies]
+zettelkasten-memory = { path = ".", editable = true }
+
+[feature.crewai.pypi-dependencies]
+crewai = ">=0.80.0"
+
+[feature.langgraph.pypi-dependencies]
+langgraph = ">=0.2.0"
+langgraph-checkpoint = ">=2.0.0"
+
+[feature.mcp.pypi-dependencies]
+mcp = ">=1.0.0"
+
+[feature.dev.dependencies]
+pytest = ">=7.0.0"
+pytest-asyncio = ">=0.21.0"
+black = ">=22.0.0"
+
+[environments]
+default = []
+crewai = ["crewai"]
+langgraph = ["langgraph"]
+mcp = ["mcp"]
+dev = ["dev"]
+
+[tasks]
+test = "pytest -v tests/"
+format = "black src/ tests/"
+lint = "python -m py_compile src/zettelkasten_memory/core.py"
