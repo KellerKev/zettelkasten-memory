@@ -3,12 +3,13 @@ Core Zettelkasten memory engine.
 
 Each memory is a "zettel" (note) with:
 - Content and metadata
-- Automatic tags extracted via TF-IDF keywords
+- Automatic tags extracted via the search backend
 - Bidirectional links to related zettels (found by semantic similarity)
 - Importance scoring based on access patterns and recency
 
-Retrieval uses TF-IDF cosine similarity with a keyword fallback.
-Connected zettels are boosted in search results (graph-aware ranking).
+Retrieval uses a pluggable search backend (TF-IDF by default, or embeddings)
+with a keyword fallback.  Connected zettels are boosted in search results
+(graph-aware ranking).
 """
 
 from __future__ import annotations
@@ -16,14 +17,17 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from .backends import (
+    EmbedFn,
+    EmbeddingBackend,
+    SearchBackend,
+    TfidfBackend,
+    backend_from_dict,
+)
 
 
 @dataclass
@@ -92,23 +96,22 @@ class ZettelMemory:
         # Persistence
         mem.save("memory.json")
         mem = ZettelMemory.load("memory.json")
+
+        # Use embeddings instead of TF-IDF:
+        from zettelkasten_memory.backends import EmbeddingBackend
+        mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=my_embed_fn))
     """
 
     def __init__(
         self,
         max_zettels: int = 5000,
         connection_threshold: float = 0.25,
+        backend: SearchBackend | None = None,
     ):
         self.max_zettels = max_zettels
         self.connection_threshold = connection_threshold
-
+        self._backend: SearchBackend = backend or TfidfBackend()
         self._zettels: dict[str, Zettel] = {}
-        self._vectorizer = TfidfVectorizer(
-            max_features=5000, stop_words="english", ngram_range=(1, 2)
-        )
-        self._vectors = None
-        self._id_order: list[str] = []  # keeps vector rows aligned with zettel IDs
-        self._dirty = True  # index needs rebuild
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,15 +140,14 @@ class ZettelMemory:
         )
 
         # Auto-extract additional tags from content
-        zettel.tags.update(self._extract_tags(content))
+        zettel.tags.update(self._backend.extract_tags(content))
 
         # Find and create bidirectional links
         self._rebuild_index_if_needed()
-        if self._vectors is not None and len(self._id_order) > 0:
-            self._link_zettel(zettel)
+        self._link_zettel(zettel)
 
         self._zettels[zid] = zettel
-        self._dirty = True
+        self._backend.needs_rebuild = True
 
         # Evict if over capacity
         if len(self._zettels) > self.max_zettels:
@@ -154,29 +156,24 @@ class ZettelMemory:
         return zettel
 
     def search(self, query: str, *, limit: int = 10, min_score: float = 0.0) -> list[SearchResult]:
-        """Search for relevant zettels using TF-IDF similarity with graph boosting."""
+        """Search for relevant zettels using the backend with graph boosting."""
         if not self._zettels:
             return []
 
         self._rebuild_index_if_needed()
 
-        if self._vectors is None:
-            return self._keyword_search(query, limit)
+        raw_pairs = self._backend.query(query)
 
-        try:
-            query_vec = self._vectorizer.transform([query])
-            raw_scores = cosine_similarity(query_vec, self._vectors)[0]
-        except Exception:
+        if not raw_pairs:
             return self._keyword_search(query, limit)
 
         # Score = similarity * importance * recency * connection_boost
         now = time.time()
         results: list[SearchResult] = []
 
-        for idx, zid in enumerate(self._id_order):
-            zettel = self._zettels[zid]
-            sim = float(raw_scores[idx])
-            if sim <= 0.0:
+        for zid, sim in raw_pairs:
+            zettel = self._zettels.get(zid)
+            if zettel is None:
                 continue
 
             recency = 1.0 / (1.0 + (now - zettel.accessed_at) / 86400)  # decay over days
@@ -188,8 +185,6 @@ class ZettelMemory:
 
         results.sort(key=lambda r: r.score, reverse=True)
 
-        # Fall back to keyword search if TF-IDF found nothing
-        # (e.g. query uses different word forms than stored content)
         if not results:
             return self._keyword_search(query, limit)
 
@@ -216,7 +211,7 @@ class ZettelMemory:
                 self._zettels[cid].connections.discard(zettel_id)
 
         del self._zettels[zettel_id]
-        self._dirty = True
+        self._backend.needs_rebuild = True
         return True
 
     def get_connected(self, zettel_id: str, *, depth: int = 1) -> list[Zettel]:
@@ -270,7 +265,7 @@ class ZettelMemory:
             "total_zettels": len(self._zettels),
             "total_connections": total_connections // 2,  # bidirectional, so halve
             "avg_connections": (total_connections / len(self._zettels)) if self._zettels else 0,
-            "index_dirty": self._dirty,
+            "index_dirty": self._backend.needs_rebuild,
         }
 
     # ------------------------------------------------------------------
@@ -288,21 +283,36 @@ class ZettelMemory:
                 "max_zettels": self.max_zettels,
                 "connection_threshold": self.connection_threshold,
             },
+            "backend": self._backend.to_dict(),
         }
         path.write_text(json.dumps(data, indent=2))
 
     @classmethod
-    def load(cls, path: str | Path) -> ZettelMemory:
-        """Load from a JSON file."""
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        embed_fn: EmbedFn | None = None,
+    ) -> ZettelMemory:
+        """Load from a JSON file.
+
+        If the saved memory used an ``EmbeddingBackend``, you must pass the
+        same *embed_fn* here (it cannot be serialised).
+        """
         data = json.loads(Path(path).read_text())
         config = data.get("config", {})
+
+        backend_data = data.get("backend", {"type": "tfidf"})
+        backend = backend_from_dict(backend_data, embed_fn=embed_fn)
+
         mem = cls(
             max_zettels=config.get("max_zettels", 5000),
             connection_threshold=config.get("connection_threshold", 0.25),
+            backend=backend,
         )
         for zd in data.get("zettels", []):
             mem._zettels[zd["id"]] = Zettel.from_dict(zd)
-        mem._dirty = True
+        mem._backend.needs_rebuild = True
         return mem
 
     # ------------------------------------------------------------------
@@ -314,32 +324,22 @@ class ZettelMemory:
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _rebuild_index_if_needed(self) -> None:
-        if not self._dirty or not self._zettels:
+        if not self._backend.needs_rebuild or not self._zettels:
             return
-        self._id_order = list(self._zettels.keys())
-        texts = [self._zettels[zid].content for zid in self._id_order]
-        try:
-            self._vectors = self._vectorizer.fit_transform(texts)
-            self._dirty = False
-        except ValueError:
-            # Can happen if all documents are stop words
-            self._vectors = None
+        ids = list(self._zettels.keys())
+        texts = [self._zettels[zid].content for zid in ids]
+        self._backend.build_index(ids, texts)
 
     def _link_zettel(self, new_zettel: Zettel) -> None:
         """Find existing zettels similar to the new one and create bidirectional links."""
-        try:
-            new_vec = self._vectorizer.transform([new_zettel.content])
-            sims = cosine_similarity(new_vec, self._vectors)[0]
-        except Exception:
-            return
-
-        for idx, zid in enumerate(self._id_order):
-            if zid in self._zettels and float(sims[idx]) >= self.connection_threshold:
+        similar = self._backend.find_similar(new_zettel.content, self.connection_threshold)
+        for zid, _sim in similar:
+            if zid in self._zettels:
                 new_zettel.connections.add(zid)
                 self._zettels[zid].connections.add(new_zettel.id)
 
     def _keyword_search(self, query: str, limit: int) -> list[SearchResult]:
-        """Fallback search when TF-IDF is unavailable."""
+        """Fallback search when the backend produces no results."""
         query_words = set(query.lower().split())
         results: list[SearchResult] = []
 
@@ -352,19 +352,6 @@ class ZettelMemory:
 
         results.sort(key=lambda r: r.score, reverse=True)
         return results[:limit]
-
-    def _extract_tags(self, text: str) -> set[str]:
-        """Extract keyword tags using TF-IDF term importance."""
-        try:
-            vec = TfidfVectorizer(max_features=200, stop_words="english")
-            tfidf = vec.fit_transform([text])
-            feature_names = vec.get_feature_names_out()
-            scores = tfidf.toarray()[0]
-            # Take top 5 terms by TF-IDF score
-            top_indices = scores.argsort()[-5:][::-1]
-            return {feature_names[i] for i in top_indices if scores[i] > 0}
-        except Exception:
-            return set()
 
     def _evict(self) -> None:
         """Remove least-valuable zettels when over capacity."""
@@ -379,4 +366,4 @@ class ZettelMemory:
         to_remove = len(self._zettels) - self.max_zettels + 10
         for zid, _ in scored[:to_remove]:
             self.delete(zid)
-        self._dirty = True
+        self._backend.needs_rebuild = True

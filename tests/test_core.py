@@ -4,7 +4,15 @@ import json
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 from zettelkasten_memory import ZettelMemory, Zettel, SearchResult
+from zettelkasten_memory.backends import TfidfBackend, EmbeddingBackend
+
+
+# ------------------------------------------------------------------
+# Original tests (TF-IDF, backward compat)
+# ------------------------------------------------------------------
 
 
 def test_add_and_get():
@@ -164,3 +172,119 @@ def test_zettel_serialization():
     assert z2.content == z.content
     assert z2.tags == z.tags
     assert z2.connections == z.connections
+
+
+# ------------------------------------------------------------------
+# Backend-specific tests
+# ------------------------------------------------------------------
+
+
+def test_tfidf_backend_protocol():
+    """TfidfBackend satisfies the SearchBackend protocol."""
+    from zettelkasten_memory.backends import SearchBackend
+
+    assert isinstance(TfidfBackend(), SearchBackend)
+
+
+def test_embedding_backend_protocol():
+    """EmbeddingBackend satisfies the SearchBackend protocol."""
+    from zettelkasten_memory.backends import SearchBackend
+
+    dummy_fn = lambda texts: np.random.randn(len(texts), 8)
+    assert isinstance(EmbeddingBackend(embed_fn=dummy_fn), SearchBackend)
+
+
+def test_tfidf_backend_roundtrip():
+    """TfidfBackend serialises and deserialises cleanly."""
+    b = TfidfBackend(max_features=1000, ngram_range=(1, 3))
+    d = b.to_dict()
+    b2 = TfidfBackend.from_dict(d)
+    assert b2.max_features == 1000
+    assert b2.ngram_range == (1, 3)
+
+
+def _make_deterministic_embed_fn(dim: int = 32):
+    """Return an embed_fn that produces deterministic vectors from text."""
+    def embed(texts: list[str]) -> np.ndarray:
+        vecs = []
+        for t in texts:
+            rng = np.random.RandomState(hash(t) % 2**31)
+            vecs.append(rng.randn(dim))
+        return np.array(vecs)
+    return embed
+
+
+def test_embedding_backend_search():
+    """EmbeddingBackend can index and query."""
+    embed_fn = _make_deterministic_embed_fn()
+    backend = EmbeddingBackend(embed_fn=embed_fn)
+
+    ids = ["a", "b", "c"]
+    texts = ["machine learning models", "database schema", "neural networks"]
+    backend.build_index(ids, texts)
+
+    results = backend.query("deep learning")
+    assert isinstance(results, list)
+    # Should return some results (exact ranking depends on random vectors)
+
+
+def test_embedding_backend_find_similar():
+    embed_fn = _make_deterministic_embed_fn()
+    backend = EmbeddingBackend(embed_fn=embed_fn)
+
+    ids = ["a", "b"]
+    texts = ["the quick brown fox", "the quick brown fox jumps"]
+    backend.build_index(ids, texts)
+
+    similar = backend.find_similar("the quick brown fox", threshold=-1.0)
+    assert len(similar) > 0
+
+
+def test_zettel_memory_with_embedding_backend():
+    """ZettelMemory works end-to-end with EmbeddingBackend."""
+    embed_fn = _make_deterministic_embed_fn()
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=embed_fn))
+
+    mem.add("The project uses FastAPI for REST APIs")
+    mem.add("PostgreSQL is the primary database")
+    mem.add("The user prefers dark mode")
+
+    results = mem.search("database")
+    assert isinstance(results, list)
+
+
+def test_save_load_with_embedding_backend(tmp_path):
+    """Save/load round-trip preserves backend type."""
+    embed_fn = _make_deterministic_embed_fn()
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=embed_fn))
+    mem.add("some content")
+    path = tmp_path / "emb_memory.json"
+    mem.save(path)
+
+    # Must pass embed_fn when loading an embedding-backed memory
+    loaded = ZettelMemory.load(path, embed_fn=embed_fn)
+    assert isinstance(loaded._backend, EmbeddingBackend)
+    assert len(loaded._zettels) == 1
+
+
+def test_save_load_preserves_tfidf_backend(tmp_path):
+    """Default save/load still uses TfidfBackend."""
+    mem = ZettelMemory()
+    mem.add("hello world")
+    path = tmp_path / "tfidf_memory.json"
+    mem.save(path)
+
+    loaded = ZettelMemory.load(path)
+    assert isinstance(loaded._backend, TfidfBackend)
+
+
+def test_backend_config_in_saved_json(tmp_path):
+    """Saved JSON includes backend config."""
+    mem = ZettelMemory()
+    mem.add("test")
+    path = tmp_path / "mem.json"
+    mem.save(path)
+
+    data = json.loads(path.read_text())
+    assert "backend" in data
+    assert data["backend"]["type"] == "tfidf"

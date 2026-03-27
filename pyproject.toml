@@ -27,6 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+embeddings = ["openai>=1.0.0"]
 crewai = ["crewai>=0.80.0"]
 langgraph = ["langgraph>=0.2.0", "langgraph-checkpoint>=2.0.0"]
 mcp = ["mcp>=1.0.0"]
