@@ -13,9 +13,12 @@ Built-in backends:
 
 from __future__ import annotations
 
+import base64
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy as np
+
+from .compression import CompressedVectors, TurboQuantCompressor
 
 
 # ------------------------------------------------------------------
@@ -198,15 +201,54 @@ class EmbeddingBackend:
 
     Any function with signature ``(list[str]) -> np.ndarray`` works — use
     sentence-transformers, Cohere, Voyage, a local ONNX model, etc.
+
+    Optional compression::
+
+        from zettelkasten_memory.compression import TurboQuantCompressor
+        backend = EmbeddingBackend(embed_fn=embed, compressor=TurboQuantCompressor())
+
+    Convenience constructor from named provider::
+
+        backend = EmbeddingBackend.from_provider("openai", model="text-embedding-3-small")
     """
 
-    def __init__(self, embed_fn: EmbedFn, batch_size: int = 64) -> None:
+    def __init__(
+        self,
+        embed_fn: EmbedFn | None = None,
+        batch_size: int = 64,
+        compressor: TurboQuantCompressor | None = None,
+    ) -> None:
         self._embed_fn = embed_fn
         self.batch_size = batch_size
+        self._compressor = compressor
 
         self._vectors: np.ndarray | None = None
+        self._compressed: CompressedVectors | None = None
         self._id_order: list[str] = []
         self._dirty = True
+
+    # -- convenience constructor ------------------------------------
+
+    @classmethod
+    def from_provider(
+        cls,
+        provider: str,
+        *,
+        compressor: TurboQuantCompressor | None = None,
+        batch_size: int = 64,
+        **provider_kwargs: Any,
+    ) -> "EmbeddingBackend":
+        """Create an EmbeddingBackend from a named provider.
+
+        Example::
+
+            backend = EmbeddingBackend.from_provider("openai", model="text-embedding-3-small")
+            backend = EmbeddingBackend.from_provider("sentence-transformers")
+        """
+        from .providers import get_provider
+
+        embed_fn = get_provider(provider, **provider_kwargs)
+        return cls(embed_fn=embed_fn, batch_size=batch_size, compressor=compressor)
 
     # -- protocol -------------------------------------------------
 
@@ -221,10 +263,18 @@ class EmbeddingBackend:
     def build_index(self, ids: list[str], texts: list[str]) -> None:
         if not ids:
             self._vectors = None
+            self._compressed = None
             self._id_order = []
             self._dirty = False
             return
         self._id_order = list(ids)
+
+        if self._embed_fn is None:
+            raise RuntimeError(
+                "EmbeddingBackend.build_index requires embed_fn, but none was "
+                "provided. Pass embed_fn when constructing or loading."
+            )
+
         embeddings: list[np.ndarray] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
@@ -234,16 +284,53 @@ class EmbeddingBackend:
         norms = np.linalg.norm(self._vectors, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1, norms)
         self._vectors = self._vectors / norms
+
+        # Compress if compressor is available
+        if self._compressor is not None:
+            self._compressed = self._compressor.compress(self._vectors)
+        else:
+            self._compressed = None
+
         self._dirty = False
 
     def query(self, text: str) -> list[tuple[str, float]]:
+        if self._id_order and self._vectors is None and self._compressed is not None:
+            return self._query_compressed(text)
         if self._vectors is None or len(self._id_order) == 0:
+            return []
+        if self._embed_fn is None:
             return []
         q_vec = np.asarray(self._embed_fn([text]))
         norm = np.linalg.norm(q_vec)
         if norm > 0:
             q_vec = q_vec / norm
-        sims = (self._vectors @ q_vec.T).flatten()
+
+        if self._compressed is not None and self._compressor is not None:
+            sims = self._compressor.asymmetric_search(q_vec, self._compressed)
+        else:
+            sims = (self._vectors @ q_vec.T).flatten()
+
+        pairs = [
+            (self._id_order[i], float(sims[i]))
+            for i in range(len(self._id_order))
+            if sims[i] > 0.0
+        ]
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        return pairs
+
+    def _query_compressed(self, text: str) -> list[tuple[str, float]]:
+        """Query using only compressed vectors (no full-precision vectors loaded)."""
+        if self._embed_fn is None or self._compressed is None:
+            return []
+        q_vec = np.asarray(self._embed_fn([text]))
+        norm = np.linalg.norm(q_vec)
+        if norm > 0:
+            q_vec = q_vec / norm
+
+        compressor = self._compressor or TurboQuantCompressor.from_dict({
+            "n_bits": 4, "proj_dim": self._compressed.proj_dim, "seed": 42,
+        })
+        sims = compressor.asymmetric_search(q_vec, self._compressed)
         pairs = [
             (self._id_order[i], float(sims[i]))
             for i in range(len(self._id_order))
@@ -255,11 +342,18 @@ class EmbeddingBackend:
     def find_similar(self, text: str, threshold: float) -> list[tuple[str, float]]:
         if self._vectors is None or len(self._id_order) == 0:
             return []
+        if self._embed_fn is None:
+            return []
         q_vec = np.asarray(self._embed_fn([text]))
         norm = np.linalg.norm(q_vec)
         if norm > 0:
             q_vec = q_vec / norm
-        sims = (self._vectors @ q_vec.T).flatten()
+
+        if self._compressed is not None and self._compressor is not None:
+            sims = self._compressor.asymmetric_search(q_vec, self._compressed)
+        else:
+            sims = (self._vectors @ q_vec.T).flatten()
+
         return [
             (self._id_order[i], float(sims[i]))
             for i in range(len(self._id_order))
@@ -279,20 +373,75 @@ class EmbeddingBackend:
         except Exception:
             return set()
 
+    # -- persistence ------------------------------------------------
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "type": "embedding",
             "batch_size": self.batch_size,
         }
 
+        # Persist compressor config
+        if self._compressor is not None:
+            result["compressor"] = self._compressor.to_dict()
+
+        # Persist vectors (compressed or raw float16)
+        if self._compressed is not None:
+            result["compressed_vectors"] = self._compressed.to_dict()
+            result["id_order"] = self._id_order
+        elif self._vectors is not None:
+            # Store as float16 to save space (2x smaller than float32)
+            result["vectors"] = base64.b64encode(
+                self._vectors.astype(np.float16).tobytes()
+            ).decode()
+            result["vectors_shape"] = list(self._vectors.shape)
+            result["id_order"] = self._id_order
+
+        return result
+
     @classmethod
-    def from_dict(cls, data: dict[str, Any], embed_fn: EmbedFn | None = None) -> "EmbeddingBackend":
-        if embed_fn is None:
-            raise ValueError(
-                "EmbeddingBackend.from_dict requires embed_fn — the embedding "
-                "function cannot be serialised. Pass it when loading."
-            )
-        return cls(embed_fn=embed_fn, batch_size=data.get("batch_size", 64))
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        embed_fn: EmbedFn | None = None,
+    ) -> "EmbeddingBackend":
+        # Restore compressor if present
+        compressor = None
+        if "compressor" in data:
+            compressor = TurboQuantCompressor.from_dict(data["compressor"])
+
+        instance = cls(
+            embed_fn=embed_fn,
+            batch_size=data.get("batch_size", 64),
+            compressor=compressor,
+        )
+
+        # Restore persisted vectors
+        id_order = data.get("id_order", [])
+        if "compressed_vectors" in data:
+            instance._compressed = CompressedVectors.from_dict(data["compressed_vectors"])
+            instance._id_order = id_order
+            instance._dirty = False
+        elif "vectors" in data:
+            shape = tuple(data["vectors_shape"])
+            raw = np.frombuffer(
+                base64.b64decode(data["vectors"]), dtype=np.float16
+            ).reshape(shape)
+            instance._vectors = raw.astype(np.float32)
+            instance._id_order = id_order
+            instance._dirty = False
+            # Compress on load if compressor is now provided
+            if compressor is not None:
+                instance._compressed = compressor.compress(instance._vectors)
+        elif id_order:
+            # Old format: had ids but no vectors — need rebuild
+            instance._id_order = id_order
+            instance._dirty = True
+        else:
+            # No vectors at all — mark dirty so build_index runs on first search
+            instance._dirty = True
+
+        return instance
 
 
 # ------------------------------------------------------------------
@@ -312,5 +461,5 @@ def backend_from_dict(data: dict[str, Any], **kwargs: Any) -> SearchBackend:
     if cls is None:
         raise ValueError(f"Unknown backend type: {btype!r}")
     if btype == "embedding":
-        return cls.from_dict(data, embed_fn=kwargs.get("embed_fn"))
+        return cls.from_dict(data, embed_fn=kwargs.get("embed_fn"))  # type: ignore[arg-type]
     return cls.from_dict(data)

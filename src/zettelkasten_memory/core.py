@@ -296,8 +296,10 @@ class ZettelMemory:
     ) -> ZettelMemory:
         """Load from a JSON file.
 
-        If the saved memory used an ``EmbeddingBackend``, you must pass the
-        same *embed_fn* here (it cannot be serialised).
+        If the saved memory used an ``EmbeddingBackend`` and no vectors were
+        persisted, you must pass the same *embed_fn* here (it cannot be
+        serialised).  When vectors *are* persisted, ``embed_fn`` is only
+        needed for adding new memories — loading and searching works without it.
         """
         data = json.loads(Path(path).read_text())
         config = data.get("config", {})
@@ -312,7 +314,15 @@ class ZettelMemory:
         )
         for zd in data.get("zettels", []):
             mem._zettels[zd["id"]] = Zettel.from_dict(zd)
-        mem._backend.needs_rebuild = True
+
+        # Only force rebuild if the backend didn't restore vectors from persistence.
+        # EmbeddingBackend.from_dict sets _dirty=False when vectors are loaded;
+        # TfidfBackend always needs rebuild (it doesn't persist the fitted vectorizer).
+        if backend.needs_rebuild is not False:
+            mem._backend.needs_rebuild = True
+        elif isinstance(backend, TfidfBackend):
+            mem._backend.needs_rebuild = True
+
         return mem
 
     # ------------------------------------------------------------------

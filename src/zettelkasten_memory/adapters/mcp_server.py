@@ -4,6 +4,13 @@ MCP server adapter — expose ZettelMemory as tools for Claude Code and other MC
 Run as a standalone server:
     python -m zettelkasten_memory.adapters.mcp_server --persist memory.json
 
+With embeddings (Ollama, local, free):
+    python -m zettelkasten_memory.adapters.mcp_server --persist memory.json --provider ollama
+
+With Snowflake Cortex:
+    python -m zettelkasten_memory.adapters.mcp_server --persist memory.json \
+        --provider snowflake --model snowflake-arctic-embed-m-v1.5
+
 Or configure in Claude Code's settings (~/.claude/settings.json):
     {
       "mcpServers": {
@@ -11,7 +18,9 @@ Or configure in Claude Code's settings (~/.claude/settings.json):
           "command": "pixi",
           "args": ["run", "-e", "mcp", "python", "-m",
                    "zettelkasten_memory.adapters.mcp_server",
-                   "--persist", "/path/to/memory.json"]
+                   "--persist", "/path/to/memory.json",
+                   "--provider", "ollama"],
+          "cwd": "/path/to/zettelkasten-memory"
         }
       }
     }
@@ -23,15 +32,33 @@ Exposes these tools to the LLM:
     - memory_delete: Delete a memory
     - memory_connections: Get connected memories (graph traversal)
     - memory_stats: Get memory statistics
+
+Supported providers (--provider):
+    tfidf               Zero config, no API keys (default)
+    ollama              Local Ollama server (nomic-embed-text)
+    openai              Requires OPENAI_API_KEY
+    cohere              Requires COHERE_API_KEY
+    voyage              Requires VOYAGE_API_KEY
+    snowflake / cortex  Requires SNOWFLAKE_ACCOUNT + SNOWFLAKE_PAT_TOKEN
+    sentence-transformers / local  Local model, no API key
+
+Environment variables for tokens:
+    OPENAI_API_KEY          OpenAI API key
+    COHERE_API_KEY          Cohere API key
+    VOYAGE_API_KEY          Voyage AI API key
+    SNOWFLAKE_ACCOUNT       Snowflake account identifier (orgname-accountname)
+    SNOWFLAKE_PAT_TOKEN     Snowflake Programmatic Access Token
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
+from zettelkasten_memory.backends import EmbeddingBackend, TfidfBackend
 from zettelkasten_memory.core import ZettelMemory
 
 try:
@@ -42,20 +69,76 @@ except ImportError:
     _HAS_MCP = False
 
 
+def _build_backend(
+    provider: str | None,
+    model: str | None,
+    token: str | None,
+    account: str | None,
+    base_url: str | None,
+    compression: bool,
+):
+    """Construct the appropriate backend from CLI flags."""
+    if provider is None or provider == "tfidf":
+        return TfidfBackend()
+
+    from zettelkasten_memory.providers import get_provider
+
+    # Build kwargs for the provider
+    kwargs: dict[str, Any] = {}
+    if model:
+        kwargs["model"] = model
+
+    # Token handling — CLI flag overrides env vars
+    if token:
+        if provider in ("openai",):
+            kwargs["api_key"] = token
+        elif provider in ("cohere",):
+            kwargs["api_key"] = token
+        elif provider in ("voyage",):
+            kwargs["api_key"] = token
+        elif provider in ("snowflake", "cortex"):
+            kwargs["token"] = token
+
+    # Snowflake account
+    if account:
+        kwargs["account"] = account
+
+    # Ollama base URL
+    if base_url and provider == "ollama":
+        kwargs["base_url"] = base_url
+
+    embed_fn = get_provider(provider, **kwargs)
+
+    # Optional compression
+    compressor = None
+    if compression:
+        from zettelkasten_memory.compression import TurboQuantCompressor
+
+        compressor = TurboQuantCompressor()
+
+    return EmbeddingBackend(embed_fn=embed_fn, compressor=compressor)
+
+
 def create_mcp_server(
     persist_path: str | None = None,
     name: str = "zettel-memory",
+    backend=None,
 ) -> Any:
     """Create an MCP server exposing ZettelMemory tools."""
     if not _HAS_MCP:
         raise ImportError("mcp is required. Install with: pixi add mcp")
 
-    mem = ZettelMemory()
+    mem = ZettelMemory(backend=backend) if backend else ZettelMemory()
     if persist_path:
         try:
             mem = ZettelMemory.load(persist_path)
+            # If we have a new backend with embeddings, swap it in
+            if backend is not None and isinstance(backend, EmbeddingBackend):
+                mem._backend = backend
+                mem._backend.needs_rebuild = True
         except (FileNotFoundError, Exception):
-            pass
+            if backend:
+                mem = ZettelMemory(backend=backend)
 
     mcp = FastMCP(name)
 
@@ -174,12 +257,75 @@ def create_mcp_server(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Zettelkasten Memory MCP Server")
-    parser.add_argument("--persist", type=str, default=None, help="Path to JSON file for persistence")
-    parser.add_argument("--name", type=str, default="zettel-memory", help="Server name")
+    parser = argparse.ArgumentParser(
+        description="Zettelkasten Memory MCP Server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Provider examples:
+  --provider tfidf                         TF-IDF (default, no API key)
+  --provider ollama                        Local Ollama (nomic-embed-text)
+  --provider ollama --model mxbai-embed-large
+  --provider openai                        Uses OPENAI_API_KEY env var
+  --provider openai --token sk-...         Explicit API key
+  --provider snowflake --account org-acct  Uses SNOWFLAKE_PAT_TOKEN env var
+  --provider snowflake --token pat-...     Explicit PAT token
+  --provider cohere                        Uses COHERE_API_KEY env var
+  --provider voyage                        Uses VOYAGE_API_KEY env var
+
+Token env vars:
+  OPENAI_API_KEY, COHERE_API_KEY, VOYAGE_API_KEY,
+  SNOWFLAKE_ACCOUNT, SNOWFLAKE_PAT_TOKEN
+""",
+    )
+    parser.add_argument(
+        "--persist", type=str, default=None,
+        help="Path to JSON file for persistence",
+    )
+    parser.add_argument(
+        "--name", type=str, default="zettel-memory",
+        help="Server name (default: zettel-memory)",
+    )
+    parser.add_argument(
+        "--provider", type=str, default=None,
+        help="Embedding provider: tfidf, ollama, openai, cohere, voyage, snowflake, sentence-transformers",
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Model name for the chosen provider",
+    )
+    parser.add_argument(
+        "--token", type=str, default=None,
+        help="API key or access token (overrides env var for the chosen provider)",
+    )
+    parser.add_argument(
+        "--account", type=str, default=None,
+        help="Snowflake account identifier (orgname-accountname)",
+    )
+    parser.add_argument(
+        "--base-url", type=str, default=None,
+        help="Base URL for Ollama (default: http://localhost:11434)",
+    )
+    parser.add_argument(
+        "--compress", action="store_true", default=False,
+        help="Enable TurboQuant vector compression (reduces storage 3-8x)",
+    )
+
     args = parser.parse_args()
 
-    server = create_mcp_server(persist_path=args.persist, name=args.name)
+    backend = _build_backend(
+        provider=args.provider,
+        model=args.model,
+        token=args.token,
+        account=args.account,
+        base_url=args.base_url,
+        compression=args.compress,
+    )
+
+    server = create_mcp_server(
+        persist_path=args.persist,
+        name=args.name,
+        backend=backend,
+    )
     server.run()
 
 

@@ -31,6 +31,15 @@ embeddings = ["openai>=1.0.0"]
 crewai = ["crewai>=0.80.0"]
 langgraph = ["langgraph>=0.2.0", "langgraph-checkpoint>=2.0.0"]
 mcp = ["mcp>=1.0.0"]
+providers-cohere = ["cohere>=5.0.0"]
+providers-voyage = ["voyageai>=0.3.0"]
+providers-local = ["sentence-transformers>=2.0.0"]
+all-providers = [
+    "openai>=1.0.0",
+    "cohere>=5.0.0",
+    "voyageai>=0.3.0",
+    "sentence-transformers>=2.0.0",
+]
 dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "black>=22.0.0"]
 
 [project.urls]

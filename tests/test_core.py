@@ -1,7 +1,9 @@
-"""Tests for the core ZettelMemory engine."""
+"""Tests for the core ZettelMemory engine.
+
+All embedding tests use real Ollama embeddings (nomic-embed-text).
+"""
 
 import json
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +13,7 @@ from zettelkasten_memory.backends import TfidfBackend, EmbeddingBackend
 
 
 # ------------------------------------------------------------------
-# Original tests (TF-IDF, backward compat)
+# TF-IDF tests (no embeddings needed)
 # ------------------------------------------------------------------
 
 
@@ -31,7 +33,6 @@ def test_search_returns_relevant_results():
 
     results = mem.search("what database does the project use?")
     assert len(results) > 0
-    # PostgreSQL should rank higher than IDE preferences
     assert "PostgreSQL" in results[0].zettel.content
 
 
@@ -46,14 +47,10 @@ def test_auto_linking():
     z1 = mem.add("FastAPI is used for the REST API endpoints")
     z2 = mem.add("The REST API uses JWT authentication on all endpoints")
 
-    # After adding z2, both should be connected since they share topic
-    # (Rebuild happens on next search)
     mem.search("api")
 
     z1_fresh = mem.get(z1.id)
     z2_fresh = mem.get(z2.id)
-    # They may or may not be connected depending on TF-IDF threshold,
-    # but the mechanism should not crash
     assert isinstance(z1_fresh.connections, set)
     assert isinstance(z2_fresh.connections, set)
 
@@ -66,17 +63,14 @@ def test_delete():
     ok = mem.delete(z.id)
     assert ok is True
     assert mem.get(z.id) is None
-
-    # Deleting again returns False
     assert mem.delete(z.id) is False
 
 
 def test_delete_cleans_connections():
-    mem = ZettelMemory(connection_threshold=0.0)  # link everything
+    mem = ZettelMemory(connection_threshold=0.0)
     z1 = mem.add("note one about APIs")
     z2 = mem.add("note two about APIs")
 
-    # Force index rebuild and re-add to get links
     mem.search("APIs")
 
     mem.delete(z1.id)
@@ -85,13 +79,12 @@ def test_delete_cleans_connections():
 
 
 def test_get_connected():
-    mem = ZettelMemory(connection_threshold=0.0)  # link everything
+    mem = ZettelMemory(connection_threshold=0.0)
     z1 = mem.add("central note about machine learning")
     z2 = mem.add("related note about machine learning models")
     z3 = mem.add("another note about machine learning training")
 
     connected = mem.get_connected(z1.id, depth=1)
-    # Should find some connected zettels (exact count depends on threshold)
     assert isinstance(connected, list)
 
 
@@ -154,7 +147,6 @@ def test_importance_clamping():
 def test_tags_extraction():
     mem = ZettelMemory()
     z = mem.add("The PostgreSQL database handles authentication and user sessions")
-    # Should have auto-extracted some tags
     assert len(z.tags) > 0
 
 
@@ -175,27 +167,23 @@ def test_zettel_serialization():
 
 
 # ------------------------------------------------------------------
-# Backend-specific tests
+# Backend protocol tests
 # ------------------------------------------------------------------
 
 
 def test_tfidf_backend_protocol():
-    """TfidfBackend satisfies the SearchBackend protocol."""
     from zettelkasten_memory.backends import SearchBackend
 
     assert isinstance(TfidfBackend(), SearchBackend)
 
 
-def test_embedding_backend_protocol():
-    """EmbeddingBackend satisfies the SearchBackend protocol."""
+def test_embedding_backend_protocol(ollama_embed_fn):
     from zettelkasten_memory.backends import SearchBackend
 
-    dummy_fn = lambda texts: np.random.randn(len(texts), 8)
-    assert isinstance(EmbeddingBackend(embed_fn=dummy_fn), SearchBackend)
+    assert isinstance(EmbeddingBackend(embed_fn=ollama_embed_fn), SearchBackend)
 
 
 def test_tfidf_backend_roundtrip():
-    """TfidfBackend serialises and deserialises cleanly."""
     b = TfidfBackend(max_features=1000, ngram_range=(1, 3))
     d = b.to_dict()
     b2 = TfidfBackend.from_dict(d)
@@ -203,72 +191,81 @@ def test_tfidf_backend_roundtrip():
     assert b2.ngram_range == (1, 3)
 
 
-def _make_deterministic_embed_fn(dim: int = 32):
-    """Return an embed_fn that produces deterministic vectors from text."""
-    def embed(texts: list[str]) -> np.ndarray:
-        vecs = []
-        for t in texts:
-            rng = np.random.RandomState(hash(t) % 2**31)
-            vecs.append(rng.randn(dim))
-        return np.array(vecs)
-    return embed
+# ------------------------------------------------------------------
+# Embedding backend tests (real Ollama embeddings)
+# ------------------------------------------------------------------
 
 
-def test_embedding_backend_search():
-    """EmbeddingBackend can index and query."""
-    embed_fn = _make_deterministic_embed_fn()
-    backend = EmbeddingBackend(embed_fn=embed_fn)
+def test_embedding_backend_search(ollama_embed_fn):
+    """EmbeddingBackend indexes and returns semantically relevant results."""
+    backend = EmbeddingBackend(embed_fn=ollama_embed_fn)
 
     ids = ["a", "b", "c"]
-    texts = ["machine learning models", "database schema", "neural networks"]
+    texts = ["machine learning models", "database schema design", "neural networks"]
     backend.build_index(ids, texts)
 
     results = backend.query("deep learning")
-    assert isinstance(results, list)
-    # Should return some results (exact ranking depends on random vectors)
+    assert len(results) > 0
+    # "neural networks" or "machine learning" should rank top for "deep learning"
+    top_id = results[0][0]
+    assert top_id in ("a", "c")
 
 
-def test_embedding_backend_find_similar():
-    embed_fn = _make_deterministic_embed_fn()
-    backend = EmbeddingBackend(embed_fn=embed_fn)
+def test_embedding_backend_find_similar(ollama_embed_fn):
+    backend = EmbeddingBackend(embed_fn=ollama_embed_fn)
 
     ids = ["a", "b"]
-    texts = ["the quick brown fox", "the quick brown fox jumps"]
+    texts = ["the quick brown fox jumps over the lazy dog", "a fast brown fox leaps over a sleepy dog"]
     backend.build_index(ids, texts)
 
-    similar = backend.find_similar("the quick brown fox", threshold=-1.0)
-    assert len(similar) > 0
+    similar = backend.find_similar("the quick brown fox jumps over the lazy dog", threshold=0.5)
+    assert len(similar) == 2  # both should be very similar
 
 
-def test_zettel_memory_with_embedding_backend():
-    """ZettelMemory works end-to-end with EmbeddingBackend."""
-    embed_fn = _make_deterministic_embed_fn()
-    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=embed_fn))
+def test_zettel_memory_with_embedding_backend(ollama_embed_fn):
+    """ZettelMemory works end-to-end with real embeddings."""
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=ollama_embed_fn))
 
     mem.add("The project uses FastAPI for REST APIs")
     mem.add("PostgreSQL is the primary database")
     mem.add("The user prefers dark mode")
 
     results = mem.search("database")
-    assert isinstance(results, list)
+    assert len(results) > 0
+    assert "PostgreSQL" in results[0].zettel.content
 
 
-def test_save_load_with_embedding_backend(tmp_path):
-    """Save/load round-trip preserves backend type."""
-    embed_fn = _make_deterministic_embed_fn()
-    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=embed_fn))
-    mem.add("some content")
+def test_embedding_search_semantic_understanding(ollama_embed_fn):
+    """Real embeddings understand synonyms and paraphrases."""
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=ollama_embed_fn))
+
+    mem.add("The application is deployed using Docker containers on AWS ECS")
+    mem.add("Authentication uses JSON Web Tokens for session management")
+    mem.add("The frontend is built with React and TypeScript")
+
+    # Query with different words — should still find Docker/deployment
+    results = mem.search("how do we ship the app to production?")
+    assert len(results) > 0
+    assert "Docker" in results[0].zettel.content
+
+
+# ------------------------------------------------------------------
+# Save/load with embedding backend
+# ------------------------------------------------------------------
+
+
+def test_save_load_with_embedding_backend(tmp_path, ollama_embed_fn):
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=ollama_embed_fn))
+    mem.add("some content about databases")
     path = tmp_path / "emb_memory.json"
     mem.save(path)
 
-    # Must pass embed_fn when loading an embedding-backed memory
-    loaded = ZettelMemory.load(path, embed_fn=embed_fn)
+    loaded = ZettelMemory.load(path, embed_fn=ollama_embed_fn)
     assert isinstance(loaded._backend, EmbeddingBackend)
     assert len(loaded._zettels) == 1
 
 
 def test_save_load_preserves_tfidf_backend(tmp_path):
-    """Default save/load still uses TfidfBackend."""
     mem = ZettelMemory()
     mem.add("hello world")
     path = tmp_path / "tfidf_memory.json"
@@ -279,7 +276,6 @@ def test_save_load_preserves_tfidf_backend(tmp_path):
 
 
 def test_backend_config_in_saved_json(tmp_path):
-    """Saved JSON includes backend config."""
     mem = ZettelMemory()
     mem.add("test")
     path = tmp_path / "mem.json"
@@ -288,3 +284,69 @@ def test_backend_config_in_saved_json(tmp_path):
     data = json.loads(path.read_text())
     assert "backend" in data
     assert data["backend"]["type"] == "tfidf"
+
+
+# ------------------------------------------------------------------
+# Embedding persistence tests
+# ------------------------------------------------------------------
+
+
+def test_save_load_preserves_embedding_vectors(tmp_path, ollama_embed_fn):
+    """Vectors survive a save/load roundtrip — no re-embedding needed on load."""
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=ollama_embed_fn))
+
+    mem.add("machine learning is a branch of artificial intelligence")
+    mem.add("relational databases store data in tables")
+    mem.add("REST APIs use HTTP methods for CRUD operations")
+
+    # Force index build
+    mem.search("test query")
+
+    path = tmp_path / "persist.json"
+    mem.save(path)
+
+    loaded = ZettelMemory.load(path, embed_fn=ollama_embed_fn)
+    assert isinstance(loaded._backend, EmbeddingBackend)
+    assert len(loaded._zettels) == 3
+    assert not loaded._backend.needs_rebuild
+
+    # Search should still return semantically correct results
+    results = loaded.search("database")
+    assert len(results) > 0
+    assert "database" in results[0].zettel.content.lower()
+
+
+def test_save_load_embedding_without_embed_fn(tmp_path, ollama_embed_fn):
+    """Loading with persisted vectors works without embed_fn for read-only access."""
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=ollama_embed_fn))
+
+    mem.add("test content one")
+    mem.add("test content two")
+    mem.search("trigger build")
+
+    path = tmp_path / "readonly.json"
+    mem.save(path)
+
+    loaded = ZettelMemory.load(path)
+    assert isinstance(loaded._backend, EmbeddingBackend)
+    assert len(loaded._zettels) == 2
+    assert not loaded._backend.needs_rebuild
+
+
+def test_save_load_backward_compat_no_vectors(tmp_path, ollama_embed_fn):
+    """Old save files without vectors trigger re-embedding on first search."""
+    mem = ZettelMemory(backend=EmbeddingBackend(embed_fn=ollama_embed_fn))
+    mem.add("some content about APIs")
+
+    path = tmp_path / "old_format.json"
+    mem.save(path)
+
+    # Simulate old format by stripping vectors from saved JSON
+    data = json.loads(path.read_text())
+    data["backend"] = {"type": "embedding", "batch_size": 64}
+    path.write_text(json.dumps(data))
+
+    loaded = ZettelMemory.load(path, embed_fn=ollama_embed_fn)
+    assert loaded._backend.needs_rebuild
+    results = loaded.search("APIs")
+    assert isinstance(results, list)

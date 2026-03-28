@@ -2,7 +2,7 @@
 authors = ["Kevin Keller <kellerkev@gmail.com>"]
 channels = ["conda-forge"]
 name = "zettelkasten-memory"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [dependencies]
@@ -33,12 +33,10 @@ pytest-asyncio = ">=0.21.0"
 black = ">=22.0.0"
 
 [environments]
-default = []
-embeddings = ["embeddings"]
-crewai = ["crewai"]
-langgraph = ["langgraph"]
-mcp = ["mcp"]
-dev = ["dev"]
+default = { solve-group = "default" }
+embeddings = { features = ["embeddings"], solve-group = "default" }
+mcp = { features = ["mcp"], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
 
 [tasks]
 test = "pytest -v tests/"
