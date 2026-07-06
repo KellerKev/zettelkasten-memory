@@ -11,7 +11,6 @@ import numpy as np
 from zettelkasten_memory import ZettelMemory, Zettel, SearchResult
 from zettelkasten_memory.backends import TfidfBackend, EmbeddingBackend
 
-
 # ------------------------------------------------------------------
 # TF-IDF tests (no embeddings needed)
 # ------------------------------------------------------------------
@@ -215,7 +214,10 @@ def test_embedding_backend_find_similar(ollama_embed_fn):
     backend = EmbeddingBackend(embed_fn=ollama_embed_fn)
 
     ids = ["a", "b"]
-    texts = ["the quick brown fox jumps over the lazy dog", "a fast brown fox leaps over a sleepy dog"]
+    texts = [
+        "the quick brown fox jumps over the lazy dog",
+        "a fast brown fox leaps over a sleepy dog",
+    ]
     backend.build_index(ids, texts)
 
     similar = backend.find_similar("the quick brown fox jumps over the lazy dog", threshold=0.5)

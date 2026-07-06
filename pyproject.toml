@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zettelkasten-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zettelkasten-inspired semantic memory for AI agents — works with CrewAI, LangGraph, and Claude Code (MCP)"
 authors = [
     {name = "Kevin Keller", email = "kellerkev@gmail.com"},
@@ -40,7 +40,18 @@ all-providers = [
     "voyageai>=0.3.0",
     "sentence-transformers>=2.0.0",
 ]
-dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "black>=22.0.0"]
+crypto = ["cryptography>=42.0.0"]
+camouflage = ["cryptography>=42.0.0"]
+smcp = ["websockets>=11.0", "cryptography>=42.0.0", "PyJWT>=2.8.0"]
+secure = ["cryptography>=42.0.0", "websockets>=11.0", "PyJWT>=2.8.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=22.0.0",
+    "cryptography>=42.0.0",
+    "websockets>=11.0",
+    "PyJWT>=2.8.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/KellerKev/zettelkasten-memory"

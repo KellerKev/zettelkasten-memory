@@ -23,9 +23,13 @@ Usage:
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 from zettelkasten_memory.core import ZettelMemory
+
+logger = logging.getLogger(__name__)
 
 
 class ZettelStorage:
@@ -48,8 +52,12 @@ class ZettelStorage:
         if persist_path:
             try:
                 self._mem = ZettelMemory.load(persist_path)
-            except (FileNotFoundError, Exception):
-                pass  # start fresh
+            except FileNotFoundError:
+                logger.info("no store at %s, starting fresh", persist_path)
+            except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
+                # Never silently replace a corrupt store: the next save()
+                # would overwrite it and destroy the data.
+                raise RuntimeError(f"corrupt or unreadable memory store at {persist_path}") from exc
 
     def save(self, value: Any, metadata: dict[str, Any] | None = None, agent: str = "") -> None:
         """Store a memory entry. Called by CrewAI after task execution."""

@@ -25,10 +25,14 @@ Usage:
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any, Iterable, Optional
 from datetime import datetime, timezone
 
 from zettelkasten_memory.core import ZettelMemory
+
+logger = logging.getLogger(__name__)
 
 try:
     from langgraph.store.base import BaseStore, Item, Result, SearchItem
@@ -44,14 +48,22 @@ def _ns_key(namespace: tuple[str, ...]) -> str:
     return "/".join(namespace)
 
 
+def _ns_matches(zettel_ns: str, prefix: str) -> bool:
+    """Exact or path-segment prefix match: 'a/b' matches 'a' but not 'a_x'."""
+    if not prefix:
+        return True
+    return zettel_ns == prefix or zettel_ns.startswith(prefix + "/")
+
+
 if _HAS_LANGGRAPH:
 
     class ZettelStore(BaseStore):
         """
         LangGraph-compatible store backed by ZettelMemory.
 
-        Namespaces are mapped to zettel metadata so memories from different
-        users/threads stay isolated during search.
+        Namespaces map to the first-class ``Zettel.namespace`` field, so
+        isolation is enforced at the storage layer: search never returns and
+        auto-linking never connects memories across namespaces.
         """
 
         def __init__(
@@ -65,8 +77,24 @@ if _HAS_LANGGRAPH:
             if persist_path:
                 try:
                     self._mem = ZettelMemory.load(persist_path)
-                except (FileNotFoundError, Exception):
-                    pass
+                except FileNotFoundError:
+                    logger.info("no store at %s, starting fresh", persist_path)
+                except (json.JSONDecodeError, KeyError, ValueError, OSError) as exc:
+                    raise RuntimeError(
+                        f"corrupt or unreadable memory store at {persist_path}"
+                    ) from exc
+                self._migrate_legacy_namespaces()
+
+        def _migrate_legacy_namespaces(self) -> None:
+            """Move pre-namespace ``_store_ns`` metadata into Zettel.namespace."""
+            migrated = 0
+            for z in self._mem._zettels.values():
+                legacy_ns = z.metadata.get("_store_ns")
+                if legacy_ns and z.namespace == "default":
+                    z.namespace = z.metadata.pop("_store_ns")
+                    migrated += 1
+            if migrated:
+                logger.info("migrated %d zettels from metadata namespaces", migrated)
 
         def _persist(self) -> None:
             if self._persist_path:
@@ -96,10 +124,9 @@ if _HAS_LANGGRAPH:
         def _handle_get(self, op: GetOp) -> Item | None:
             ns = _ns_key(op.namespace)
             key = op.key
-            target_id = f"{ns}:{key}"
 
             for z in self._mem._zettels.values():
-                if z.metadata.get("_store_ns") == ns and z.metadata.get("_store_key") == key:
+                if z.namespace == ns and z.metadata.get("_store_key") == key:
                     return Item(
                         value=z.metadata.get("_store_value", {"content": z.content}),
                         key=key,
@@ -117,20 +144,24 @@ if _HAS_LANGGRAPH:
             to_delete = [
                 zid
                 for zid, z in self._mem._zettels.items()
-                if z.metadata.get("_store_ns") == ns and z.metadata.get("_store_key") == key
+                if z.namespace == ns and z.metadata.get("_store_key") == key
             ]
             for zid in to_delete:
                 self._mem.delete(zid)
 
             if op.value is not None:
-                content = op.value.get("content", str(op.value)) if isinstance(op.value, dict) else str(op.value)
+                content = (
+                    op.value.get("content", str(op.value))
+                    if isinstance(op.value, dict)
+                    else str(op.value)
+                )
                 self._mem.add(
                     content,
                     metadata={
-                        "_store_ns": ns,
                         "_store_key": key,
                         "_store_value": op.value,
                     },
+                    namespace=ns,
                 )
             self._persist()
 
@@ -140,18 +171,13 @@ if _HAS_LANGGRAPH:
             limit = op.limit or 10
 
             if query:
-                results = self._mem.search(query, limit=limit * 2)
-                # Filter to namespace
-                filtered = [
-                    r
-                    for r in results
-                    if r.zettel.metadata.get("_store_ns", "").startswith(ns)
-                ][:limit]
+                # namespace=None: prefix semantics need post-filtering across
+                # namespaces; exact scoping is applied below with _ns_matches.
+                results = self._mem.search(query, limit=limit * 2, namespace=None)
+                filtered = [r for r in results if _ns_matches(r.zettel.namespace, ns)][:limit]
             else:
                 filtered_zettels = [
-                    z
-                    for z in self._mem._zettels.values()
-                    if z.metadata.get("_store_ns", "").startswith(ns)
+                    z for z in self._mem._zettels.values() if _ns_matches(z.namespace, ns)
                 ]
                 from zettelkasten_memory.core import SearchResult
 
@@ -160,12 +186,11 @@ if _HAS_LANGGRAPH:
             items: list[SearchItem] = []
             for r in filtered:
                 z = r.zettel
-                store_ns = z.metadata.get("_store_ns", "")
                 items.append(
                     SearchItem(
                         value=z.metadata.get("_store_value", {"content": z.content}),
                         key=z.metadata.get("_store_key", z.id),
-                        namespace=tuple(store_ns.split("/")) if store_ns else (),
+                        namespace=tuple(z.namespace.split("/")) if z.namespace else (),
                         created_at=datetime.fromtimestamp(z.created_at, tz=timezone.utc),
                         updated_at=datetime.fromtimestamp(z.accessed_at, tz=timezone.utc),
                         score=r.score,
@@ -176,9 +201,8 @@ if _HAS_LANGGRAPH:
         def _handle_list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
             namespaces: set[tuple[str, ...]] = set()
             for z in self._mem._zettels.values():
-                ns = z.metadata.get("_store_ns", "")
-                if ns:
-                    namespaces.add(tuple(ns.split("/")))
+                if z.namespace and z.namespace != "default":
+                    namespaces.add(tuple(z.namespace.split("/")))
             return sorted(namespaces)
 
 else:

@@ -20,7 +20,6 @@ import numpy as np
 
 from .compression import CompressedVectors, TurboQuantCompressor
 
-
 # ------------------------------------------------------------------
 # Protocol
 # ------------------------------------------------------------------
@@ -128,9 +127,7 @@ class TfidfBackend:
         except Exception:
             return []
         pairs = [
-            (self._id_order[i], float(sims[i]))
-            for i in range(len(self._id_order))
-            if sims[i] > 0.0
+            (self._id_order[i], float(sims[i])) for i in range(len(self._id_order)) if sims[i] > 0.0
         ]
         pairs.sort(key=lambda x: x[1], reverse=True)
         return pairs
@@ -311,9 +308,7 @@ class EmbeddingBackend:
             sims = (self._vectors @ q_vec.T).flatten()
 
         pairs = [
-            (self._id_order[i], float(sims[i]))
-            for i in range(len(self._id_order))
-            if sims[i] > 0.0
+            (self._id_order[i], float(sims[i])) for i in range(len(self._id_order)) if sims[i] > 0.0
         ]
         pairs.sort(key=lambda x: x[1], reverse=True)
         return pairs
@@ -327,14 +322,16 @@ class EmbeddingBackend:
         if norm > 0:
             q_vec = q_vec / norm
 
-        compressor = self._compressor or TurboQuantCompressor.from_dict({
-            "n_bits": 4, "proj_dim": self._compressed.proj_dim, "seed": 42,
-        })
+        compressor = self._compressor or TurboQuantCompressor.from_dict(
+            {
+                "n_bits": 4,
+                "proj_dim": self._compressed.proj_dim,
+                "seed": 42,
+            }
+        )
         sims = compressor.asymmetric_search(q_vec, self._compressed)
         pairs = [
-            (self._id_order[i], float(sims[i]))
-            for i in range(len(self._id_order))
-            if sims[i] > 0.0
+            (self._id_order[i], float(sims[i])) for i in range(len(self._id_order)) if sims[i] > 0.0
         ]
         pairs.sort(key=lambda x: x[1], reverse=True)
         return pairs
@@ -424,9 +421,7 @@ class EmbeddingBackend:
             instance._dirty = False
         elif "vectors" in data:
             shape = tuple(data["vectors_shape"])
-            raw = np.frombuffer(
-                base64.b64decode(data["vectors"]), dtype=np.float16
-            ).reshape(shape)
+            raw = np.frombuffer(base64.b64decode(data["vectors"]), dtype=np.float16).reshape(shape)
             instance._vectors = raw.astype(np.float32)
             instance._id_order = id_order
             instance._dirty = False

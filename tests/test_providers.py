@@ -1,8 +1,10 @@
 """Tests for embedding providers.
 
-Tests the Ollama provider end-to-end with real embeddings.
-Other providers (OpenAI, Cohere, Voyage, SentenceTransformers) are tested
-for construction and registry only — they require API keys or heavy deps.
+Real-embedding tests run against whatever local endpoint the ``ollama_embed_fn``
+fixture (conftest.py) finds — Ollama or an OpenAI-compatible server — and skip
+cleanly when neither is available.  Other providers (OpenAI, Cohere, Voyage,
+SentenceTransformers) are tested for construction and registry only — they
+require API keys or heavy deps.
 """
 
 import numpy as np
@@ -10,6 +12,7 @@ import pytest
 
 from zettelkasten_memory.providers import (
     PROVIDER_REGISTRY,
+    MalgraEmbeddings,
     OllamaEmbeddings,
     OpenAIEmbeddings,
     CohereEmbeddings,
@@ -20,37 +23,35 @@ from zettelkasten_memory.providers import (
 )
 from zettelkasten_memory.backends import EmbeddingBackend
 
-
 # ------------------------------------------------------------------
-# Ollama (real embeddings)
+# Real embeddings (local endpoint via conftest fixture)
 # ------------------------------------------------------------------
 
 
-def test_ollama_embeddings_shape():
-    """OllamaEmbeddings returns correct shape from real Ollama server."""
-    embed = OllamaEmbeddings(model="nomic-embed-text")
-    result = embed(["hello world", "machine learning"])
+def test_local_embeddings_shape(ollama_embed_fn):
+    """The local provider returns correct shape."""
+    result = ollama_embed_fn(["hello world", "machine learning"])
     assert result.shape[0] == 2
     assert result.shape[1] > 0
     assert result.dtype == np.float32
 
 
-def test_ollama_embeddings_deterministic():
+def test_local_embeddings_deterministic(ollama_embed_fn):
     """Same input produces the same embedding."""
-    embed = OllamaEmbeddings(model="nomic-embed-text")
-    r1 = embed(["test sentence"])
-    r2 = embed(["test sentence"])
+    r1 = ollama_embed_fn(["test sentence"])
+    r2 = ollama_embed_fn(["test sentence"])
     np.testing.assert_array_almost_equal(r1, r2, decimal=5)
 
 
-def test_ollama_embeddings_semantic_similarity():
+def test_local_embeddings_semantic_similarity(ollama_embed_fn):
     """Similar texts produce similar embeddings, dissimilar texts don't."""
-    embed = OllamaEmbeddings(model="nomic-embed-text")
-    vecs = embed([
-        "the cat sat on the mat",          # 0
-        "a kitten rested on the rug",       # 1 — similar to 0
-        "quantum physics equations",        # 2 — unrelated
-    ])
+    vecs = ollama_embed_fn(
+        [
+            "the cat sat on the mat",  # 0
+            "a kitten rested on the rug",  # 1 — similar to 0
+            "quantum physics equations",  # 2 — unrelated
+        ]
+    )
     # Normalize for cosine similarity
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     vecs = vecs / norms
@@ -64,18 +65,19 @@ def test_ollama_embeddings_semantic_similarity():
     )
 
 
-def test_ollama_batching():
-    """Ollama provider handles batching correctly."""
-    embed = OllamaEmbeddings(model="nomic-embed-text", batch_size=2)
+def test_local_embeddings_batching(ollama_embed_fn):
+    """Batching splits inputs but returns one array."""
+    provider = type(ollama_embed_fn)(
+        model=ollama_embed_fn.model, base_url=ollama_embed_fn.base_url, batch_size=2
+    )
     texts = ["text one", "text two", "text three", "text four", "text five"]
-    result = embed(texts)
+    result = provider(texts)
     assert result.shape[0] == 5
 
 
-def test_ollama_single_text():
+def test_local_embeddings_single_text(ollama_embed_fn):
     """Single text embedding works."""
-    embed = OllamaEmbeddings(model="nomic-embed-text")
-    result = embed(["just one sentence"])
+    result = ollama_embed_fn(["just one sentence"])
     assert result.shape[0] == 1
 
 
@@ -101,7 +103,18 @@ def test_get_provider_case_insensitive():
 
 
 def test_registry_contains_all_providers():
-    expected = {"openai", "cohere", "voyage", "sentence-transformers", "local", "ollama", "snowflake", "cortex"}
+    expected = {
+        "openai",
+        "cohere",
+        "voyage",
+        "sentence-transformers",
+        "local",
+        "ollama",
+        "snowflake",
+        "cortex",
+        "malgra",
+        "openai-compat",
+    }
     assert expected == set(PROVIDER_REGISTRY.keys())
 
 
@@ -117,9 +130,9 @@ def test_from_provider_ollama():
     assert isinstance(backend._embed_fn, OllamaEmbeddings)
 
 
-def test_from_provider_ollama_index_and_search():
-    """Full pipeline: from_provider → build_index → query with real embeddings."""
-    backend = EmbeddingBackend.from_provider("ollama", model="nomic-embed-text")
+def test_from_provider_ollama_index_and_search(ollama_embed_fn):
+    """Full pipeline: build_index → query with real embeddings."""
+    backend = EmbeddingBackend(embed_fn=ollama_embed_fn)
 
     ids = ["a", "b", "c"]
     texts = [
@@ -183,6 +196,7 @@ def test_snowflake_provider_constructs():
 
 def test_snowflake_provider_reads_env():
     import os
+
     old_acct = os.environ.get("SNOWFLAKE_ACCOUNT")
     old_tok = os.environ.get("SNOWFLAKE_PAT_TOKEN")
     try:
@@ -222,3 +236,82 @@ def test_get_provider_snowflake_aliases():
     p2 = get_provider("cortex", account="a", token="t")
     assert isinstance(p1, SnowflakeCortexEmbeddings)
     assert isinstance(p2, SnowflakeCortexEmbeddings)
+
+
+# ------------------------------------------------------------------
+# Malgra / OpenAI-compatible gateway provider
+# ------------------------------------------------------------------
+
+
+def test_malgra_provider_defaults(monkeypatch):
+    for var in ("MALGRA_URL", "MALGRA_API_KEY", "MALGRA_AGENT_JWT"):
+        monkeypatch.delenv(var, raising=False)
+    provider = MalgraEmbeddings()
+    assert provider.base_url == "http://127.0.0.1:8766"
+    assert provider._api_key == "dummy"  # zero-secret client by design
+    assert provider.timeout == 30.0
+
+
+def test_malgra_provider_env(monkeypatch):
+    monkeypatch.setenv("MALGRA_URL", "http://gateway:9000/")
+    monkeypatch.setenv("MALGRA_AGENT_JWT", "jwt-token")
+    provider = MalgraEmbeddings()
+    assert provider.base_url == "http://gateway:9000"
+    assert provider._agent_jwt == "jwt-token"
+
+
+def test_get_provider_malgra_aliases():
+    p1 = get_provider("malgra")
+    p2 = get_provider("openai-compat")
+    assert isinstance(p1, MalgraEmbeddings)
+    assert isinstance(p2, MalgraEmbeddings)
+
+
+def test_malgra_request_shape_and_auth_header():
+    """Serve one request with a stub HTTP server; assert path, bearer, ordering."""
+    import http.server
+    import json
+    import threading
+
+    captured: dict = {}
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            captured["path"] = self.path
+            captured["auth"] = self.headers.get("Authorization")
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            captured["body"] = body
+            # respond out of order to verify index-based sorting
+            data = [
+                {"index": 1, "embedding": [0.0, 1.0]},
+                {"index": 0, "embedding": [1.0, 0.0]},
+            ]
+            payload = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Stub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        provider = MalgraEmbeddings(
+            model="test-model",
+            base_url=f"http://127.0.0.1:{port}",
+            agent_jwt="agent-jwt-123",
+            max_retries=1,
+        )
+        result = provider(["first", "second"])
+    finally:
+        server.shutdown()
+
+    assert captured["path"] == "/v1/embeddings"
+    assert captured["auth"] == "Bearer agent-jwt-123"  # JWT wins over api_key
+    assert captured["body"] == {"model": "test-model", "input": ["first", "second"]}
+    np.testing.assert_array_equal(result, np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32))

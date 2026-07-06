@@ -24,7 +24,6 @@ from typing import Any
 
 import numpy as np
 
-
 # ------------------------------------------------------------------
 # Base
 # ------------------------------------------------------------------
@@ -83,12 +82,14 @@ class OpenAIEmbeddings(_BaseProvider):
         model: str = "text-embedding-3-small",
         *,
         api_key: str | None = None,
+        base_url: str | None = None,
         batch_size: int = 64,
         max_retries: int = 3,
     ) -> None:
         super().__init__(batch_size=batch_size, max_retries=max_retries)
         self.model = model
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self._base_url = base_url
         self._client = None
 
     def _get_client(self):
@@ -100,7 +101,7 @@ class OpenAIEmbeddings(_BaseProvider):
                     "OpenAIEmbeddings requires the 'openai' package. "
                     "Install it with: pip install openai"
                 )
-            self._client = OpenAI(api_key=self._api_key)
+            self._client = OpenAI(api_key=self._api_key, base_url=self._base_url)
         return self._client
 
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
@@ -277,10 +278,12 @@ class OllamaEmbeddings(_BaseProvider):
         base_url: str = "http://localhost:11434",
         batch_size: int = 64,
         max_retries: int = 3,
+        timeout: float = 30.0,
     ) -> None:
         super().__init__(batch_size=batch_size, max_retries=max_retries)
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
 
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
         import urllib.request
@@ -292,7 +295,7 @@ class OllamaEmbeddings(_BaseProvider):
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = _json.loads(resp.read())
         return np.array(data["embeddings"], dtype=np.float32)
 
@@ -333,11 +336,13 @@ class SnowflakeCortexEmbeddings(_BaseProvider):
         token: str | None = None,
         batch_size: int = 512,
         max_retries: int = 3,
+        timeout: float = 30.0,
     ) -> None:
         super().__init__(batch_size=batch_size, max_retries=max_retries)
         self.model = model
         self._account = account or os.environ.get("SNOWFLAKE_ACCOUNT")
         self._token = token or os.environ.get("SNOWFLAKE_PAT_TOKEN")
+        self.timeout = timeout
 
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
         import urllib.request
@@ -354,10 +359,7 @@ class SnowflakeCortexEmbeddings(_BaseProvider):
                 "SNOWFLAKE_PAT_TOKEN env var"
             )
 
-        url = (
-            f"https://{self._account}.snowflakecomputing.com"
-            f"/api/v2/cortex/inference:embed"
-        )
+        url = f"https://{self._account}.snowflakecomputing.com" f"/api/v2/cortex/inference:embed"
         payload = _json.dumps({"text": texts, "model": self.model}).encode()
         req = urllib.request.Request(
             url,
@@ -369,7 +371,7 @@ class SnowflakeCortexEmbeddings(_BaseProvider):
                 "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
             },
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = _json.loads(resp.read())
 
         # Response: {"data": [{"embedding": [[...]], "index": 0}, ...]}
@@ -377,6 +379,71 @@ class SnowflakeCortexEmbeddings(_BaseProvider):
         items = sorted(data["data"], key=lambda x: x["index"])
         embeddings = [item["embedding"][0] for item in items]
         return np.array(embeddings, dtype=np.float32)
+
+
+# ------------------------------------------------------------------
+# Malgra / OpenAI-compatible gateway
+# ------------------------------------------------------------------
+
+
+class MalgraEmbeddings(_BaseProvider):
+    """OpenAI-compatible embeddings via an LLM gateway (malgra) or any
+    server speaking the ``/v1/embeddings`` API (llama.cpp, LiteLLM, vLLM...).
+
+    Designed for zero-secret clients: the gateway holds the real provider
+    credentials, the client sends a dummy key (or a gateway-issued agent JWT).
+    No extra packages needed — uses ``urllib`` directly.
+
+    Usage::
+
+        embed_fn = MalgraEmbeddings()                      # gateway on 127.0.0.1:8766
+        embed_fn = MalgraEmbeddings(
+            model="text-embedding-3-small",
+            base_url="http://127.0.0.1:8092",              # e.g. local llama.cpp
+        )
+
+    Env vars: ``MALGRA_URL``, ``MALGRA_API_KEY``, ``MALGRA_AGENT_JWT``.
+    """
+
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        agent_jwt: str | None = None,
+        batch_size: int = 64,
+        max_retries: int = 3,
+        timeout: float = 30.0,
+    ) -> None:
+        super().__init__(batch_size=batch_size, max_retries=max_retries)
+        self.model = model
+        self.base_url = (
+            base_url or os.environ.get("MALGRA_URL") or "http://127.0.0.1:8766"
+        ).rstrip("/")
+        self._agent_jwt = agent_jwt or os.environ.get("MALGRA_AGENT_JWT")
+        self._api_key = api_key or os.environ.get("MALGRA_API_KEY") or "dummy"
+        self.timeout = timeout
+
+    def _embed_batch(self, texts: list[str]) -> np.ndarray:
+        import urllib.request
+        import json as _json
+
+        payload = _json.dumps({"model": self.model, "input": texts}).encode()
+        bearer = self._agent_jwt or self._api_key
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/embeddings",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {bearer}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = _json.loads(resp.read())
+
+        items = sorted(data["data"], key=lambda x: x.get("index", 0))
+        return np.array([item["embedding"] for item in items], dtype=np.float32)
 
 
 # ------------------------------------------------------------------
@@ -392,6 +459,8 @@ PROVIDER_REGISTRY: dict[str, type[_BaseProvider]] = {
     "ollama": OllamaEmbeddings,
     "snowflake": SnowflakeCortexEmbeddings,
     "cortex": SnowflakeCortexEmbeddings,
+    "malgra": MalgraEmbeddings,
+    "openai-compat": MalgraEmbeddings,
 }
 
 
@@ -400,7 +469,5 @@ def get_provider(name: str, **kwargs: Any) -> _BaseProvider:
     cls = PROVIDER_REGISTRY.get(name.lower())
     if cls is None:
         available = ", ".join(sorted(PROVIDER_REGISTRY.keys()))
-        raise ValueError(
-            f"Unknown provider {name!r}. Available: {available}"
-        )
+        raise ValueError(f"Unknown provider {name!r}. Available: {available}")
     return cls(**kwargs)

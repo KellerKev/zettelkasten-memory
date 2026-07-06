@@ -23,7 +23,6 @@ from typing import Any
 
 import numpy as np
 
-
 # ------------------------------------------------------------------
 # Compressed representation
 # ------------------------------------------------------------------
@@ -150,7 +149,9 @@ class TurboQuantCompressor:
             np.round((rotated - mins[:, None]) / scales[:, None]),
             0,
             self._n_levels,
-        ).astype(np.uint8)  # (n, dim)
+        ).astype(
+            np.uint8
+        )  # (n, dim)
 
         # Dequantize to get approximate vectors
         approx = codes.astype(np.float32) * scales[:, None] + mins[:, None]

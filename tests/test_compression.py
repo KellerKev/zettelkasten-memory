@@ -10,7 +10,6 @@ from zettelkasten_memory.compression import CompressedVectors, TurboQuantCompres
 from zettelkasten_memory.backends import EmbeddingBackend
 from zettelkasten_memory import ZettelMemory
 
-
 # ------------------------------------------------------------------
 # Compress / decompress roundtrip
 # ------------------------------------------------------------------
