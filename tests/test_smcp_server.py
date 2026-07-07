@@ -22,6 +22,7 @@ pytest.importorskip("jwt")
 websockets = pytest.importorskip("websockets")
 
 from zettelkasten_memory.adapters.smcp_protocol import (
+    ReplayGuard,
     SMCPCrypto,
     SMCPProtocolError,
     make_message,
@@ -185,6 +186,27 @@ def test_wrong_secret_cannot_forge(crypto):
         parse_message(crypto, json.dumps(wire))
 
 
+def test_replay_of_fresh_frame_rejected(crypto):
+    """M5: a captured, still-fresh, validly-signed frame cannot be resubmitted."""
+    guard = ReplayGuard(ttl=300)
+    wire = make_message(crypto, "heartbeat", {"x": 1})
+    raw = json.dumps(wire)
+    # first delivery is accepted
+    parse_message(crypto, raw, max_skew=300, replay_guard=guard)
+    # verbatim resubmission is rejected as a replay
+    with pytest.raises(SMCPProtocolError, match="replay"):
+        parse_message(crypto, raw, max_skew=300, replay_guard=guard)
+
+
+def test_non_numeric_timestamp_is_protocol_error(crypto):
+    """L4: a bad timestamp yields SMCPProtocolError, not a bare ValueError."""
+    wire = make_message(crypto, "heartbeat", {"x": 1})
+    wire["timestamp"] = "not-a-number"
+    # signature no longer matches -> rejected as invalid signature, never crashes
+    with pytest.raises(SMCPProtocolError):
+        parse_message(crypto, json.dumps(wire), max_skew=300)
+
+
 # ------------------------------------------------------------------
 # Server flow
 # ------------------------------------------------------------------
@@ -311,6 +333,89 @@ def test_namespace_binding_from_identity(server, crypto):
     assert resp["payload"]["result"] == []
 
 
+def test_cross_tenant_get_delete_isolated(server, crypto):
+    # store as tenant-a, learn the id, then try to read/delete it as tenant-b
+    token_a = _auth(server, crypto, API_KEY_A)
+    token_b = _auth(server, crypto, API_KEY_B)
+    stored = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {
+            "token": token_a,
+            "tool_name": "memory_store",
+            "parameters": {"content": "tenant-a private id-addressable secret"},
+        },
+    )
+    zid = stored["payload"]["result"]["id"]
+
+    got = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {"token": token_b, "tool_name": "memory_get", "parameters": {"memory_id": zid}},
+    )
+    assert got["payload"]["result"] == {"error": "Memory not found"}
+
+    deleted = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {"token": token_b, "tool_name": "memory_delete", "parameters": {"memory_id": zid}},
+    )
+    assert deleted["payload"]["result"]["deleted"] is False
+    # tenant-a can still read it — tenant-b's delete was a no-op
+    still = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {"token": token_a, "tool_name": "memory_get", "parameters": {"memory_id": zid}},
+    )
+    assert still["payload"]["result"].get("id") == zid
+
+
+def test_stats_scoped_to_namespace(server, crypto):
+    # H2: a tenant's stats never disclose another tenant's namespace/counts
+    token_a = _auth(server, crypto, API_KEY_A)
+    token_b = _auth(server, crypto, API_KEY_B)
+    _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {
+            "token": token_a,
+            "tool_name": "memory_store",
+            "parameters": {"content": "tenant-a note one"},
+        },
+    )
+    resp = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {"token": token_b, "tool_name": "memory_stats", "parameters": {}},
+    )
+    stats = resp["payload"]["result"]
+    assert stats["total_zettels"] == 0
+    assert "namespaces" not in stats
+    assert "tenant-a" not in json.dumps(stats)
+
+
+def test_limit_is_clamped(server, crypto):
+    token = _auth(server, crypto, API_KEY_A)
+    resp = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {
+            "token": token,
+            "tool_name": "memory_search",
+            "parameters": {"query": "anything", "limit": 10_000_000},
+        },
+    )
+    # does not raise / hang; returns a bounded (here empty) result
+    assert resp["type"] == "tool_response"
+
+
 def test_expired_jwt_rejected(crypto):
     config = SMCPServerConfig(secret_key=SECRET, api_keys={API_KEY_A: "tenant-a"}, token_ttl=-10)
     server = ZettelSMCPServer(ZettelMemory(), config)
@@ -366,12 +471,59 @@ def test_config_multi_tenant_and_prefix_fallback():
         {
             "SMCP_SECRET_KEY": "s",  # fallback prefix
             "ZETTEL_SMCP_API_KEYS": "k1=ns1, k2=ns2",
+            "ZETTEL_SMCP_JWT_SECRET": "independent-secret",  # required for multi-ns
             "ZETTEL_SMCP_PORT": "9999",
         }
     )
     assert cfg.secret_key == "s"
     assert cfg.api_keys == {"k1": "ns1", "k2": "ns2"}
+    assert cfg.jwt_secret == "independent-secret"
     assert cfg.port == 9999
+
+
+def test_config_multi_namespace_requires_jwt_secret():
+    # serving >1 namespace without an independent JWT secret is refused (C1)
+    with pytest.raises(SystemExit, match="JWT_SECRET"):
+        SMCPServerConfig.from_env(
+            {"ZETTEL_SMCP_SECRET_KEY": "s", "ZETTEL_SMCP_API_KEYS": "k1=ns1,k2=ns2"}
+        )
+    # a single namespace is fine without one (random per-process secret)
+    cfg = SMCPServerConfig.from_env(
+        {"ZETTEL_SMCP_SECRET_KEY": "s", "ZETTEL_SMCP_API_KEYS": "k1=ns1,k2=ns1"}
+    )
+    assert cfg.jwt_secret == ""
+
+
+def test_forged_jwt_from_channel_secret_rejected(crypto):
+    """C1 regression: a client holding only the channel secret must not be able
+    to forge an auth token for any namespace by deriving the old JWT secret."""
+    import jwt as pyjwt
+
+    config = SMCPServerConfig(
+        secret_key=SECRET,
+        api_keys={API_KEY_A: "tenant-a", API_KEY_B: "tenant-b"},
+        jwt_secret="server-only-independent-secret",
+    )
+    server = ZettelSMCPServer(ZettelMemory(), config)
+    server.crypto = crypto
+
+    forged = pyjwt.encode(
+        {
+            "ns": "tenant-a",
+            "permissions": ["tool_invoke", "discovery"],
+            "exp": int(time.time()) + 3600,
+        },
+        crypto.derived_jwt_secret,  # what any client could recompute
+        algorithm="HS256",
+    )
+    resp = _roundtrip(
+        server,
+        crypto,
+        "tool_invoke",
+        {"token": forged, "tool_name": "memory_stats", "parameters": {}},
+    )
+    assert resp["type"] == "error"
+    assert "Unauthorized" in resp["payload"]["error"]
 
 
 def test_config_rejects_unsupported_mode():

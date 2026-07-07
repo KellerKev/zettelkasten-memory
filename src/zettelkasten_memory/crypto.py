@@ -50,9 +50,14 @@ _MODE_RAW_KEY = 0x01
 _MODE_SCRYPT = 0x02
 _NONCE_SIZE = 12
 _SALT_SIZE = 16
-_SCRYPT_LOG2_N = 15
+_SCRYPT_LOG2_N = 17  # N = 131072 (OWASP-recommended minimum)
 _SCRYPT_R = 8
 _SCRYPT_P = 1
+# Largest log2(N) we will run at load time. scrypt needs ~128*r*N bytes, and
+# the 256 MiB maxmem cap below rejects anything larger, so bound the accepted
+# range to what can actually derive (and error cleanly instead of DoS-ing).
+_SCRYPT_MAX_LOG2_N = 18
+_SCRYPT_MAXMEM = 384 * 1024 * 1024
 
 ENV_KEY = "ZETTEL_MEMORY_KEY"
 ENV_KEY_FILE = "ZETTEL_MEMORY_KEY_FILE"
@@ -130,13 +135,34 @@ def resolve_passphrase(passphrase: str | None = None) -> str | None:
 
 
 def encryption_available(key: bytes | str | None = None, passphrase: str | None = None) -> bool:
-    """True when any key material (key, key file, or passphrase) is configured."""
+    """True when any key material (key, key file, or passphrase) is configured.
+
+    NOTE: this returns False for *misconfigured* key material (e.g. a
+    malformed ``ZETTEL_MEMORY_KEY``) as well as for *absent* material. Callers
+    that must fail closed on a configured-but-broken key should use
+    ``key_configured`` to tell the two cases apart.
+    """
     try:
         if resolve_key(key) is not None:
             return True
     except EncryptionError:
         return False
     return resolve_passphrase(passphrase) is not None
+
+
+def key_configured(key: bytes | str | None = None, passphrase: str | None = None) -> bool:
+    """True when the user *intended* to configure encryption.
+
+    Unlike ``encryption_available``, this reports True even when the material
+    is present but invalid (bad hex, wrong length, unreadable key file), so a
+    caller can fail closed instead of silently writing plaintext on a typo.
+    """
+    if key is not None:
+        return True
+    for var in (ENV_KEY, ENV_KEY_FILE, ENV_PASSPHRASE):
+        if os.environ.get(var):
+            return True
+    return passphrase is not None
 
 
 def is_encrypted(blob: bytes) -> bool:
@@ -146,15 +172,20 @@ def is_encrypted(blob: bytes) -> bool:
 def _derive_scrypt(passphrase: str, salt: bytes, log2_n: int, r: int, p: int) -> bytes:
     import hashlib
 
-    return hashlib.scrypt(
-        passphrase.encode("utf-8"),
-        salt=salt,
-        n=1 << log2_n,
-        r=r,
-        p=p,
-        maxmem=256 * 1024 * 1024,
-        dklen=32,
-    )
+    try:
+        return hashlib.scrypt(
+            passphrase.encode("utf-8"),
+            salt=salt,
+            n=1 << log2_n,
+            r=r,
+            p=p,
+            maxmem=_SCRYPT_MAXMEM,
+            dklen=32,
+        )
+    except (ValueError, MemoryError) as exc:
+        # e.g. parameters that exceed maxmem — surface as a clean crypto error
+        # rather than a bare ValueError leaking out of load().
+        raise EncryptionError("scrypt parameters exceed supported limits") from exc
 
 
 def encrypt_bytes(
@@ -229,7 +260,7 @@ def decrypt_bytes(
         phrase = resolve_passphrase(passphrase)
         if phrase is None:
             raise KeyNotFoundError(f"store is encrypted with a passphrase: set {ENV_PASSPHRASE}")
-        if log2_n > 22:
+        if not (1 <= log2_n <= _SCRYPT_MAX_LOG2_N) or r < 1 or p < 1:
             raise EncryptionError("unreasonable scrypt parameters in envelope")
         aes_key = _derive_scrypt(phrase, salt, log2_n, r, p)
     else:

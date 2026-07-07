@@ -31,9 +31,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import os
 import re
 from typing import Iterable
+
+logger = logging.getLogger(__name__)
 
 ENV_PII_KEY = "ZETTEL_PII_KEY"
 
@@ -42,8 +45,12 @@ _TOKEN_RE = re.compile(r"\[pii-([a-z0-9_]+)-([a-z2-7]+)(?:-(\d{4}))?\]")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # 13-19 digits allowing single space/dash separators (validated by Luhn below)
 _CARD_RE = re.compile(r"(?<![\d.])(?:\d[ -]?){12,18}\d(?![\d.])")
-# international-ish phone: 7+ digits with optional +, separators, parens
-_PHONE_RE = re.compile(r"(?<![\w.])\+?\d(?:[\d\s().-]{5,18})\d(?![\w.])")
+# international-ish phone: 7+ digits with optional +, spaces, dashes, parens.
+# Dots are deliberately excluded from the separator class so IP addresses and
+# dotted version strings (e.g. 192.168.1.100, 1.2.3) are never matched.
+_PHONE_RE = re.compile(r"(?<![\w.])\+?\d(?:[\d\s()-]{5,18})\d(?![\w.])")
+# date shapes (2026-07-06, 12/31/2026) that would otherwise look phone-like
+_DATE_RE = re.compile(r"^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}$")
 
 
 class CamouflageError(Exception):
@@ -94,9 +101,17 @@ class CamouflageCodec:
         extra_patterns: mapping of category name -> regex for custom PII
             (SSN, IBAN, ...).
         keep_last4: append the last four digits to credit-card tokens as a
-            human-usable hint.
+            human-usable hint. Off by default: those four digits become literal
+            token text that is embedded, indexed, and persisted, so enabling it
+            deliberately leaks a fragment of the card into the index/store.
         reveal: when False, ``detokenize`` is a no-op and retrieval returns
             tokens instead of plaintext PII.
+
+    Note: built-in detection covers only email, phone, and Luhn-valid card
+    numbers. Other PII (SSN, IBAN, IP addresses, dates of birth, passport /
+    national-ID numbers, postal addresses) is NOT detected unless supplied via
+    ``extra_patterns`` — the "PII never reaches the index/store" guarantee
+    holds only for the configured categories.
     """
 
     def __init__(
@@ -106,7 +121,7 @@ class CamouflageCodec:
         categories: Iterable[str] = ("email", "phone", "credit_card"),
         names: Iterable[str] | None = None,
         extra_patterns: dict[str, str] | None = None,
-        keep_last4: bool = True,
+        keep_last4: bool = False,
         reveal: bool = True,
     ) -> None:
         try:
@@ -197,8 +212,10 @@ class CamouflageCodec:
                     suffix = f"-{digits[-4:]}" if self.keep_last4 else ""
                     return f"[pii-credit_card-{self._encrypt(value, _cat)}{suffix}]"
                 if _cat == "phone":
+                    if _DATE_RE.match(value.strip()):
+                        return value  # a date, not a phone number
                     digits = re.sub(r"\D", "", value)
-                    if len(digits) < 7:
+                    if not (7 <= len(digits) <= 15):  # E.164 caps at 15 digits
                         return value
                 return f"[pii-{_cat}-{self._encrypt(value, _cat)}]"
 
@@ -208,14 +225,21 @@ class CamouflageCodec:
     def detokenize(self, text: str) -> str:
         """Restore original PII values for ``[pii-...]`` tokens in *text*.
 
-        No-op when ``reveal`` is False.  Raises CamouflageError on tokens
-        that fail authentication (wrong key or tampering).
+        No-op when ``reveal`` is False.  A token that fails authentication
+        (wrong key, tampering, or a token-shaped string that was never one of
+        ours) is left untouched and a warning is logged — detokenization never
+        raises from the read path, so one poisoned memory cannot break
+        retrieval for a whole namespace.
         """
         if not text or not self.reveal:
             return text
 
         def _restore(match: re.Match[str]) -> str:
             category, token = match.group(1), match.group(2)
-            return self._decrypt(token, category)
+            try:
+                return self._decrypt(token, category)
+            except CamouflageError:
+                logger.warning("leaving unverifiable pii token in place (category=%s)", category)
+                return match.group(0)
 
         return _TOKEN_RE.sub(_restore, text)

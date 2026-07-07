@@ -300,10 +300,12 @@ mem.search("kevin.k@corp.io billing")   # raw query tokenizes the same way -> fo
 
 Detected PII (emails, phones, Luhn-valid cards, explicit name lists, custom regexes)
 is replaced with deterministic AES-SIV tokens **before** indexing, auto-linking, and
-embedding calls. Determinism means the same entity gets the same token everywhere, so
-semantic search and auto-linking still correlate memories about the same person —
-without the person's data ever leaving the process. `CamouflageCodec(reveal=False)`
-keeps tokens in all output (for pipelines that must never see plaintext PII).
+embedding calls — across content, nested metadata, and tags. Determinism means the
+same entity gets the same token everywhere, so semantic search and auto-linking still
+correlate memories about the same person — without the person's data ever leaving the
+process. `CamouflageCodec(reveal=False)` keeps tokens in all output (for pipelines that
+must never see plaintext PII). Built-in detection covers email, phone, and card numbers
+only; add `extra_patterns` for SSNs, IBANs, etc.
 
 ### Namespace isolation (multi-tenant)
 
@@ -411,13 +413,17 @@ The stdio MCP server trusts the local process — fine for a personal Claude Cod
 setup, wrong for anything networked. The **SMCP server** exposes the same six tools
 over SMCP v3: a WebSocket channel where every payload is Fernet-encrypted and
 HMAC-signed (keys derived from a shared secret via PBKDF2-600k + HKDF), clients
-authenticate with an API key, and the server issues short-lived HS256 JWTs.
-It is wire-compatible with existing SMCP v3 clients — terminal agents, LLM
-gateways, and remote-execution agents connect without modification.
+authenticate with an API key, and the server issues short-lived HS256 JWTs
+signed with a secret **independent of the channel key** (so no client can
+forge another tenant's token), with per-connection replay rejection on top of
+the freshness window. It is wire-compatible with existing SMCP v3 clients —
+terminal agents, LLM gateways, and remote-execution agents connect without
+modification.
 
 ```bash
 export ZETTEL_SMCP_SECRET_KEY="a-strong-shared-secret"
 export ZETTEL_SMCP_API_KEYS="alpha-key=tenant-a,beta-key=tenant-b"   # key -> namespace
+export ZETTEL_SMCP_JWT_SECRET=$(python -c "import os; print(os.urandom(32).hex())")  # required for multi-tenant
 export ZETTEL_MEMORY_KEY=$(python -c "import os; print(os.urandom(32).hex())")
 
 pixi run -e secure python -m zettelkasten_memory.adapters.smcp_server \
@@ -426,14 +432,17 @@ pixi run -e secure python -m zettelkasten_memory.adapters.smcp_server \
 
 **Multi-tenancy is identity-bound:** each API key maps to a namespace, the namespace
 rides inside the JWT, and every tool call is scoped to it at the storage layer.
-A client-supplied `namespace` parameter is ignored. There are no default
-credentials — the server refuses to start without a secret and at least one API key.
+A client-supplied `namespace` parameter is ignored, and `memory_stats` reports only
+the caller's own namespace. There are no default credentials — the server refuses to
+start without a secret and at least one API key, and (when it serves more than one
+namespace) without an explicit `ZETTEL_SMCP_JWT_SECRET` that is independent of the
+shared channel secret.
 
 | Env var | Meaning | Default |
 |---|---|---|
 | `ZETTEL_SMCP_SECRET_KEY` | shared secret for the encrypted channel | required |
 | `ZETTEL_SMCP_API_KEY` / `_API_KEYS` | single key, or `key=ns` pairs | required |
-| `ZETTEL_SMCP_JWT_SECRET` | JWT signing secret | derived from secret key |
+| `ZETTEL_SMCP_JWT_SECRET` | JWT signing secret, independent of the channel key | required for multi-namespace; else random per-process |
 | `ZETTEL_SMCP_KDF_SALT` | per-deployment KDF salt (match clients) | `malgra-tunnel-v3` |
 | `ZETTEL_SMCP_HOST` / `_PORT` | bind address | `127.0.0.1:8765` |
 | `ZETTEL_SMCP_TOKEN_TTL` | JWT lifetime (s) | `3600` |

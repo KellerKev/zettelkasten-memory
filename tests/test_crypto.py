@@ -159,6 +159,35 @@ def test_save_encrypt_true_without_key_raises(tmp_path):
         mem.save(tmp_path / "m.json", encrypt=True)
 
 
+def test_save_auto_fails_closed_on_invalid_key(monkeypatch, tmp_path):
+    # H1: a configured-but-invalid key must NOT silently write plaintext.
+    monkeypatch.setenv(ENV_KEY, "not-valid-hex-or-base64-and-wrong-length")
+    mem = ZettelMemory()
+    mem.add("secret note that must not hit disk in the clear")
+    path = tmp_path / "m.json"
+    with pytest.raises(EncryptionError):
+        mem.save(path)  # encrypt="auto"
+    assert not path.exists()  # nothing was written
+
+
+def test_save_auto_plaintext_when_truly_no_key(tmp_path):
+    # H1 boundary: absent key material still means legitimate plaintext.
+    mem = ZettelMemory()
+    mem.add("plain note")
+    path = tmp_path / "m.json"
+    mem.save(path)
+    assert path.read_bytes().startswith(b"{")
+
+
+def test_load_rejects_out_of_range_scrypt_params(tmp_path):
+    # M6: an envelope with an out-of-range scrypt N is rejected cleanly
+    # (EncryptionError), not a bare ValueError, and without a huge allocation.
+    blob = bytearray(encrypt_bytes(b"data", passphrase="pw"))
+    blob[22] = 40  # log2(N)=40 — absurd; header is AAD so this also fails auth
+    with pytest.raises(EncryptionError):
+        decrypt_bytes(bytes(blob), passphrase="pw")
+
+
 def test_load_wrong_key_raises_not_garbage(monkeypatch, tmp_path):
     path = tmp_path / "m.json"
     mem = ZettelMemory()

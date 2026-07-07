@@ -147,7 +147,7 @@ if _HAS_LANGGRAPH:
                 if z.namespace == ns and z.metadata.get("_store_key") == key
             ]
             for zid in to_delete:
-                self._mem.delete(zid)
+                self._mem.delete(zid, namespace=ns)
 
             if op.value is not None:
                 content = (

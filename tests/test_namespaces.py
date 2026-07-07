@@ -60,9 +60,14 @@ def test_auto_links_never_cross_namespaces():
 def test_get_and_delete_namespace_guard():
     mem = _mem()
     z = mem.add("guarded note", namespace="a")
-    assert mem.get(z.id) is z  # unguarded lookup still works
+    # fail-closed: the default scope is "default", so a zettel in "a" is not
+    # found/deleted unless the caller opts into its namespace (or None)
+    assert mem.get(z.id) is None
+    assert mem.get(z.id, namespace=None) is z  # explicit cross-namespace lookup
     assert mem.get(z.id, namespace="a") is z
     assert mem.get(z.id, namespace="b") is None
+    assert mem.delete(z.id) is False  # default scope does not touch "a"
+    assert z.id in mem._zettels
     assert mem.delete(z.id, namespace="b") is False
     assert z.id in mem._zettels
     assert mem.delete(z.id, namespace="a") is True
@@ -79,8 +84,10 @@ def test_get_connected_namespace_guard():
     assert mem.get_connected(a.id, namespace="b") == []
     connected = mem.get_connected(a.id, namespace="a")
     assert b.id not in {z.id for z in connected}
-    # unguarded traversal still follows legacy links
-    assert b.id in {z.id for z in mem.get_connected(a.id)}
+    # fail-closed default scope ("default") won't traverse from a root in "a"
+    assert mem.get_connected(a.id) == []
+    # explicit unguarded traversal still follows legacy links
+    assert b.id in {z.id for z in mem.get_connected(a.id, namespace=None)}
 
 
 def test_eviction_namespace_fairness():

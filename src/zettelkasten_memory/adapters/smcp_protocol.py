@@ -77,10 +77,14 @@ class SMCPCrypto:
 
     @property
     def derived_jwt_secret(self) -> str:
-        """Deterministic HS256 signing key derived from the shared secret.
+        """Deterministic value derived from the shared channel secret.
 
-        Used when no explicit jwt_secret is configured, so setting a real
-        secret_key never leaves a publicly-known default JWT secret in play.
+        SECURITY: do NOT use this to sign auth JWTs. Every client holds the
+        channel secret, so any client can recompute this value and forge a
+        token for any namespace. The server signs JWTs with an independent
+        secret (``ZETTEL_SMCP_JWT_SECRET`` or a random per-process key). This
+        property is retained only for wire-compat tooling and tests that assert
+        such a forged token is rejected.
         """
         return self._jwt_secret
 
@@ -111,13 +115,44 @@ class SMCPCrypto:
         signature = message.get("signature")
         if not signature:
             return False
+        try:
+            timestamp = float(message.get("timestamp", 0))
+        except (TypeError, ValueError):
+            return False
         expected = self.sign(
             str(message.get("id", "")),
             str(message.get("type", "")),
-            float(message.get("timestamp", 0)),
+            timestamp,
             message.get("payload"),
         )
         return hmac.compare_digest(expected, str(signature))
+
+
+class ReplayGuard:
+    """Rejects a signed message whose id was already seen inside the window.
+
+    The signature/freshness checks alone let a captured, still-fresh envelope
+    replay verbatim (e.g. a ``tool_invoke:memory_delete``).  One guard per
+    connection remembers recently-seen message ids until they age out of the
+    freshness window, so a duplicate id is rejected.  Memory is bounded: ids
+    are pruned once older than ``ttl``.
+    """
+
+    def __init__(self, ttl: float = 300.0) -> None:
+        self._ttl = ttl
+        self._seen: dict[str, float] = {}
+
+    def check(self, msg_id: str, now: float) -> bool:
+        """Return True if *msg_id* is fresh; record it. False if a replay."""
+        if self._seen:
+            for k in [k for k, exp in self._seen.items() if exp <= now]:
+                del self._seen[k]
+        if not msg_id:
+            return False  # an unidentified message cannot be de-duplicated
+        if msg_id in self._seen:
+            return False
+        self._seen[msg_id] = now + self._ttl
+        return True
 
 
 def make_message(
@@ -148,14 +183,17 @@ def parse_message(
     raw: str | bytes,
     *,
     max_skew: float = 300.0,
+    replay_guard: "ReplayGuard | None" = None,
 ) -> dict[str, Any]:
     """Verify, decrypt, and freshness-check an incoming envelope.
 
     Returns the envelope dict with ``payload`` replaced by the decrypted
     payload.  Verification order matters: signature first (over the wire
-    payload), then decryption, then timestamp freshness.  ``max_skew=0``
-    disables the freshness check (the reference implementation does not
-    enforce one; this is an accept-side hardening knob).
+    payload), then decryption, then timestamp freshness, then replay.
+    ``max_skew=0`` disables the freshness check (the reference implementation
+    does not enforce one; this is an accept-side hardening knob).  Pass a
+    per-connection *replay_guard* to reject a re-submitted (still-fresh)
+    envelope by message id.
     """
     try:
         message = json.loads(raw)
@@ -178,12 +216,15 @@ def parse_message(
         except Exception as exc:
             raise SMCPProtocolError("decryption failed") from exc
 
-    if max_skew:
+    if max_skew or replay_guard is not None:
         try:
             ts = float(message.get("timestamp", 0))
         except (TypeError, ValueError) as exc:
             raise SMCPProtocolError("invalid timestamp") from exc
-        if abs(time.time() - ts) > max_skew:
+        now = time.time()
+        if max_skew and abs(now - ts) > max_skew:
             raise SMCPProtocolError("stale message (timestamp outside accepted window)")
+        if replay_guard is not None and not replay_guard.check(str(message.get("id", "")), now):
+            raise SMCPProtocolError("replayed or unidentified message")
 
     return message

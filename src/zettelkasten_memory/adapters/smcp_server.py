@@ -16,7 +16,10 @@ Run:
 
 All secrets come from environment variables (never CLI flags):
     ZETTEL_SMCP_SECRET_KEY   shared secret for the encrypted channel (required)
-    ZETTEL_SMCP_JWT_SECRET   JWT HS256 secret (default: derived from secret key)
+    ZETTEL_SMCP_JWT_SECRET   JWT HS256 secret, independent of the channel secret
+                             (required for multi-namespace servers; a
+                             single-namespace server gets a random per-process
+                             secret if unset)
     ZETTEL_SMCP_KDF_SALT     per-deployment KDF salt (must match clients)
     ZETTEL_SMCP_API_KEY      single API key bound to ZETTEL_NAMESPACE/default
     ZETTEL_SMCP_API_KEYS     comma-separated key=namespace pairs
@@ -41,6 +44,7 @@ import asyncio
 import hmac as _hmac
 import logging
 import os
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -48,6 +52,7 @@ from typing import Any, Mapping
 from zettelkasten_memory.adapters import _tools
 from zettelkasten_memory.adapters.smcp_protocol import (
     PROTOCOL_VERSION,
+    ReplayGuard,
     SMCPCrypto,
     SMCPProtocolError,
     make_message,
@@ -110,6 +115,22 @@ class SMCPServerConfig:
                 "refuses to run without client authentication"
             )
 
+        # The JWT signing key must be independent of the channel secret: every
+        # client holds the channel secret, so a JWT secret derived from it could
+        # be recomputed by any client to forge a token for another namespace.
+        # When more than one namespace is served, require an explicit,
+        # independent ZETTEL_SMCP_JWT_SECRET so tokens are not cross-forgeable
+        # (and so tokens validate across replicas).  A single-namespace server
+        # gets a random per-process secret if none is set.
+        jwt_secret = _env("JWT_SECRET", env)
+        if not jwt_secret and len(set(api_keys.values())) > 1:
+            raise SystemExit(
+                "ZETTEL_SMCP_JWT_SECRET is required when serving multiple "
+                "namespaces: it must be independent of the shared channel "
+                "secret, which every client holds and could otherwise use to "
+                "forge tokens for another tenant"
+            )
+
         mode = _env("MODE", env)
         if mode and mode.lower() != "simple":
             raise SystemExit(
@@ -122,7 +143,7 @@ class SMCPServerConfig:
             port=int(_env("PORT", env, "8765")),
             node_id=_env("NODE_ID", env, "zettel-memory"),
             secret_key=secret_key,
-            jwt_secret=_env("JWT_SECRET", env),
+            jwt_secret=jwt_secret,
             kdf_salt=_env("KDF_SALT", env),
             api_keys=api_keys,
             token_ttl=int(_env("TOKEN_TTL", env, "3600")),
@@ -156,7 +177,11 @@ class ZettelSMCPServer:
         self.persist_path = persist_path
         self.encrypt = encrypt
         self.crypto = SMCPCrypto(config.secret_key, config.kdf_salt)
-        self._jwt_secret = config.jwt_secret or self.crypto.derived_jwt_secret
+        # Independent of the channel secret by design (see SMCPServerConfig).
+        # An explicit secret is stable across restarts/replicas; otherwise a
+        # random per-process secret is used (outstanding tokens are invalidated
+        # on restart, and clients simply re-authenticate).
+        self._jwt_secret = config.jwt_secret or secrets.token_urlsafe(32)
 
     # -- message handlers ------------------------------------------------
 
@@ -329,15 +354,28 @@ class ZettelSMCPServer:
 
         peer = getattr(websocket, "remote_address", None)
         logger.info("connection from %s", peer)
+        # One replay guard per connection: a signed, still-fresh envelope may
+        # not be re-submitted.  Sized to the freshness window so memory stays
+        # bounded.  Only meaningful when freshness checking is on.
+        replay_guard = ReplayGuard(ttl=self.config.max_skew) if self.config.max_skew else None
         try:
             async for raw in websocket:
                 try:
-                    message = parse_message(self.crypto, raw, max_skew=self.config.max_skew)
+                    message = parse_message(
+                        self.crypto,
+                        raw,
+                        max_skew=self.config.max_skew,
+                        replay_guard=replay_guard,
+                    )
+                    response = self._handle_message(message)
                 except SMCPProtocolError as exc:
                     logger.warning("rejected message from %s: %s", peer, exc)
                     await websocket.send(_json.dumps(self._error("", str(exc))))
                     continue
-                response = self._handle_message(message)
+                except Exception as exc:  # never let one bad frame kill the task
+                    logger.warning("error handling message from %s: %s", peer, exc)
+                    await websocket.send(_json.dumps(self._error("", "internal error")))
+                    continue
                 await websocket.send(_json.dumps(response))
         except websockets.ConnectionClosed:
             logger.info("connection closed: %s", peer)

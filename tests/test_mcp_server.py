@@ -154,7 +154,11 @@ async def test_namespace_binding(tmp_path):
     )
     assert results == []
     stats = json.loads(await call_tool(server_b, "memory_stats"))
-    assert stats["namespace_zettels"] == 0
+    # scoped stats: tenant-b sees only its own (empty) namespace, and the
+    # response must not disclose tenant-a's existence, count, or the global map
+    assert stats["total_zettels"] == 0
+    assert "namespaces" not in stats
+    assert "tenant-a" not in json.dumps(stats)
 
 
 @pytest.mark.asyncio

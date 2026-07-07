@@ -23,6 +23,11 @@ ENV_NAMESPACE = "ZETTEL_NAMESPACE"
 ENV_MAX_CONTENT = "ZETTEL_MAX_CONTENT_BYTES"
 ENV_MAX_METADATA = "ZETTEL_MAX_METADATA_BYTES"
 
+# Upper bounds on client-controlled numeric inputs, so a single request cannot
+# force an unbounded result set or graph traversal.
+MAX_LIMIT = 100
+MAX_DEPTH = 6
+
 
 def build_backend(
     provider: str | None,
@@ -134,6 +139,7 @@ def store(
 def search(
     mem: ZettelMemory, query: str, limit: int = 5, *, namespace: str
 ) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), MAX_LIMIT))
     results = mem.search(query, limit=limit, namespace=namespace)
     return [
         {
@@ -161,14 +167,16 @@ def delete(mem: ZettelMemory, memory_id: str, *, namespace: str) -> dict[str, An
 def connections(
     mem: ZettelMemory, memory_id: str, depth: int = 1, *, namespace: str
 ) -> list[dict[str, Any]]:
+    depth = max(1, min(int(depth), MAX_DEPTH))
     connected = mem.get_connected(memory_id, depth=depth, namespace=namespace)
     return [{"id": z.id, "content": z.content, "tags": sorted(z.tags)} for z in connected]
 
 
 def stats(mem: ZettelMemory, *, namespace: str) -> dict[str, Any]:
-    s = mem.stats
-    s["namespace_zettels"] = s.get("namespaces", {}).get(namespace, 0)
-    return s
+    # Scoped to the caller's namespace: never expose other tenants' names,
+    # counts, or the global totals (see ZettelMemory.namespace_stats).
+    return mem.namespace_stats(namespace)
+
 
 
 # SMCP capability descriptions (JSON-schema-flavored, mirrors the MCP tools)

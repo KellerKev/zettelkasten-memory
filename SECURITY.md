@@ -22,7 +22,7 @@ Key material resolution order:
 1. explicit `key=` argument (bytes, hex, or base64; 32 bytes)
 2. `ZETTEL_MEMORY_KEY` environment variable
 3. `ZETTEL_MEMORY_KEY_FILE` — path to a key file
-4. `ZETTEL_MEMORY_PASSPHRASE` — scrypt-derived (N=2^15, r=8, p=1, per-file salt)
+4. `ZETTEL_MEMORY_PASSPHRASE` — scrypt-derived (N=2^17, r=8, p=1, per-file salt)
 
 `save(encrypt="auto")` (the default) encrypts iff key material is present.
 A store that was loaded encrypted refuses to be silently rewritten as
@@ -43,6 +43,18 @@ encryption; the category is bound as associated data). Tokenization happens
 in `ZettelMemory.add()` *before* hashing, tag extraction, indexing,
 auto-linking, and any embedding call — raw PII never reaches the search
 index, the link graph, the persisted store, or third-party embedding APIs.
+Content, all nested metadata strings (dict values, list items, keys), and
+caller-supplied tags are covered. On the way out, a token that fails
+authentication (wrong key, tampering, or a token-shaped string that was never
+ours) is left in place rather than raising — a single poisoned memory cannot
+break retrieval for a namespace.
+
+Built-in detection covers only **email, phone, and Luhn-valid card numbers**.
+Other PII (SSN, IBAN, IP addresses, dates of birth, national-ID numbers,
+addresses) is not detected unless supplied via `extra_patterns` — the
+guarantee holds only for the configured categories. `keep_last4` (append a
+card's last four digits to its token) is **off by default**, since those
+digits would otherwise be embedded, indexed, and persisted as literal text.
 
 Determinism is deliberate: the same email yields the same token in every
 memory, so semantic search and auto-linking still correlate entities.
@@ -69,9 +81,14 @@ consuming LLM than a plausible-looking fake value.
   traverse cross-namespace edges even in legacy data.
 - Eviction is namespace-fair: a high-volume tenant cannot push other
   tenants' memories out.
-- `namespace=None` bypasses scoping on `search`/`get`/`delete`/
-  `get_connected`. It exists for adapter internals (e.g. LangGraph prefix
-  semantics). Servers must never expose it.
+- All of `search`/`get`/`delete`/`get_connected`/`get_context` default to
+  `namespace="default"` — they fail closed. `namespace=None` explicitly
+  bypasses scoping and exists only for adapter internals (e.g. LangGraph
+  prefix semantics); servers must never expose it.
+- `memory_stats` is scoped to the caller's namespace: it reports only that
+  namespace's counts and never discloses other namespaces' names, sizes, or
+  the global totals (use `ZettelMemory.stats` for the owner-level global
+  view, `namespace_stats` for the tenant-safe one).
 
 Server binding: the stdio MCP server is bound to one namespace per process
 (`--namespace` / `ZETTEL_NAMESPACE`) since stdio has no per-connection
@@ -83,16 +100,29 @@ ignores client-supplied namespace parameters.
 
 The SMCP adapter implements the SMCP v3 wire protocol: PBKDF2 (600k) + HKDF
 key schedule from a shared secret, Fernet-encrypted payloads, HMAC-SHA256
-payload-bound signatures verified before decryption, handshake nonce echo
-for mutual authentication, API-key auth issuing HS256 JWTs (algorithm
-pinned), and an accept-side message-freshness window.
+payload-bound signatures verified before decryption, handshake nonce echo,
+API-key auth issuing HS256 JWTs (algorithm pinned), an accept-side
+message-freshness window, and per-connection replay rejection.
 
 - Secrets are environment-only (`ZETTEL_SMCP_SECRET_KEY`, ...). The server
   refuses to start without a secret and at least one API key; there are no
   default credentials.
-- If `ZETTEL_SMCP_JWT_SECRET` is unset, the JWT secret is derived from the
-  shared secret via HKDF — setting a real secret never leaves a
-  publicly-known default signing key in play.
+- **The JWT signing key is independent of the channel secret.** Every client
+  holds the shared `ZETTEL_SMCP_SECRET_KEY` to use the encrypted channel, so
+  a JWT secret *derived* from it could be recomputed by any client to forge a
+  token for another namespace. A server that serves **more than one
+  namespace therefore requires an explicit `ZETTEL_SMCP_JWT_SECRET`** and
+  refuses to start without one; a single-namespace server uses a random
+  per-process secret if none is set (outstanding tokens are invalidated on
+  restart — clients simply re-authenticate). Set an explicit secret when you
+  run multiple replicas so tokens validate across them.
+- **Replay protection.** The freshness window alone lets a captured,
+  still-fresh envelope replay verbatim; each connection additionally rejects
+  a message id it has already seen within the window. This is best-effort
+  hardening on top of the freshness check, not a substitute for TLS.
+- The handshake nonce is echoed as connection metadata only; because all
+  clients share the channel secret it does not by itself authenticate an
+  individual client.
 - **No TLS termination in this server.** Bind to loopback or a
   cluster-internal address, or front it with a TLS proxy or an encrypted
   tunnel. The SMCP envelope encrypts and authenticates every payload
