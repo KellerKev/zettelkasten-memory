@@ -116,6 +116,8 @@ def create_mcp_server(
         tags: list[str] | None = None,
         importance: float = 0.5,
         metadata: dict[str, str] | None = None,
+        content_type: str = "text",
+        search_text: str | None = None,
     ) -> str:
         """Store a new memory. Returns the memory ID.
 
@@ -127,16 +129,28 @@ def create_mcp_server(
             tags: Optional labels for categorization (e.g. ["preference", "architecture"]).
             importance: 0.0 to 1.0 — how important this memory is (default 0.5).
             metadata: Optional key-value pairs for extra context.
+            content_type: Kind of content — "text" (default), "code", "data", "image", ...
+            search_text: For non-text content whose raw content isn't searchable
+                (e.g. an image path), the caption/description to index on instead.
         """
         try:
-            result = _tools.store(mem, content, tags, importance, metadata, namespace=bound_ns)
+            result = _tools.store(
+                mem,
+                content,
+                tags,
+                importance,
+                metadata,
+                content_type,
+                search_text,
+                namespace=bound_ns,
+            )
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
         _persist()
         return json.dumps(result)
 
     @mcp.tool()
-    def memory_search(query: str, limit: int = 5) -> str:
+    def memory_search(query: str, limit: int = 5, content_type: str | None = None) -> str:
         """Search memories by semantic similarity.
 
         Returns the most relevant memories for the given query, ranked by
@@ -145,8 +159,11 @@ def create_mcp_server(
         Args:
             query: What to search for (natural language).
             limit: Max number of results (default 5).
+            content_type: Optionally restrict to one content type (e.g. "code").
         """
-        return json.dumps(_tools.search(mem, query, limit, namespace=bound_ns), indent=2)
+        return json.dumps(
+            _tools.search(mem, query, limit, content_type, namespace=bound_ns), indent=2
+        )
 
     @mcp.tool()
     def memory_get(memory_id: str) -> str:

@@ -53,6 +53,12 @@ class Zettel:
     access_count: int = 0
     importance: float = 0.5
     namespace: str = "default"
+    # Multi-modal support: content_type labels the kind of content ("text",
+    # "code", "data", "image", ...). search_text is the text actually indexed —
+    # empty means "use content", but for non-text content (e.g. an image path)
+    # it holds the caption/description that makes the memory searchable.
+    content_type: str = "text"
+    search_text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +72,8 @@ class Zettel:
             "access_count": self.access_count,
             "importance": self.importance,
             "namespace": self.namespace,
+            "content_type": self.content_type,
+            "search_text": self.search_text,
         }
 
     @classmethod
@@ -81,7 +89,14 @@ class Zettel:
             access_count=data.get("access_count", 0),
             importance=data.get("importance", 0.5),
             namespace=data.get("namespace", "default"),
+            content_type=data.get("content_type", "text"),
+            search_text=data.get("search_text", ""),
         )
+
+    @property
+    def index_text(self) -> str:
+        """The text used for indexing/search/linking (search_text or content)."""
+        return self.search_text or self.content
 
 
 @dataclass
@@ -199,6 +214,7 @@ class ZettelMemory:
             content=detok(zettel.content),
             metadata=self._map_strings(zettel.metadata, detok),
             tags={detok(t) for t in zettel.tags},
+            search_text=detok(zettel.search_text) if zettel.search_text else "",
         )
 
     # ------------------------------------------------------------------
@@ -213,11 +229,18 @@ class ZettelMemory:
         tags: set[str] | None = None,
         importance: float = 0.5,
         namespace: str = "default",
+        content_type: str = "text",
+        search_text: str | None = None,
     ) -> Zettel:
         """Store a new zettel, auto-link to related zettels, and return it.
 
         Auto-linking never crosses namespaces: a zettel only links to zettels
         in its own *namespace*.
+
+        *content_type* labels the kind of content ("text", "code", "data",
+        "image", ...). For non-text content whose raw *content* isn't the text
+        you'd search by (e.g. an image path), pass *search_text* — the
+        caption/description that gets indexed, tagged, and linked on instead.
 
         Raises ValueError if *content* or *metadata* exceed the configured
         size limits (``max_content_bytes`` / ``max_metadata_bytes``).
@@ -235,8 +258,12 @@ class ZettelMemory:
         # PII is tokenized before anything downstream sees the content:
         # the ID hash, tag extraction, the search index, auto-linking, and
         # any embedding provider all operate on the camouflaged text. Nested
-        # metadata and caller-supplied tags are tokenized too.
+        # metadata, caller-supplied tags, and search_text are tokenized too.
         content, metadata, tags = self._mask_in(content, metadata, tags)
+        if search_text:
+            search_text = (
+                self._camouflage.tokenize(search_text) if self._camouflage else search_text
+            )
 
         zid = self._make_id(content)
         now = time.time()
@@ -250,10 +277,12 @@ class ZettelMemory:
             accessed_at=now,
             importance=max(0.0, min(1.0, importance)),
             namespace=namespace,
+            content_type=content_type,
+            search_text=search_text or "",
         )
 
-        # Auto-extract additional tags from content
-        zettel.tags.update(self._backend.extract_tags(content))
+        # Auto-extract additional tags from the indexable text
+        zettel.tags.update(self._backend.extract_tags(zettel.index_text))
 
         # Find and create bidirectional links
         self._rebuild_index_if_needed()
@@ -285,12 +314,16 @@ class ZettelMemory:
         limit: int = 10,
         min_score: float = 0.0,
         namespace: str | None = "default",
+        content_type: str | None = None,
     ) -> list[SearchResult]:
         """Search for relevant zettels using the backend with graph boosting.
 
         Results are scoped to *namespace* (``"default"`` unless overridden).
         Pass ``namespace=None`` to search across all namespaces — intended for
         adapter-internal use only; servers must always pass a bound namespace.
+
+        *content_type* optionally restricts results to one kind of content
+        (e.g. ``"code"`` or ``"image"``); ``None`` returns all types.
 
         With a camouflage codec, the query is tokenized the same way stored
         content was (so searching for a raw email finds its token) and results
@@ -307,7 +340,8 @@ class ZettelMemory:
         raw_pairs = self._backend.query(query)
 
         if not raw_pairs:
-            return self._reveal_results(self._keyword_search(query, limit, namespace))
+            fallback = self._keyword_search(query, limit, namespace, content_type)
+            return self._reveal_results(fallback)
 
         # Score = similarity * importance * recency * connection_boost
         now = time.time()
@@ -318,6 +352,8 @@ class ZettelMemory:
             if zettel is None:
                 continue
             if namespace is not None and zettel.namespace != namespace:
+                continue
+            if content_type is not None and zettel.content_type != content_type:
                 continue
 
             recency = 1.0 / (1.0 + (now - zettel.accessed_at) / 86400)  # decay over days
@@ -331,7 +367,8 @@ class ZettelMemory:
         results.sort(key=lambda r: r.score, reverse=True)
 
         if not results:
-            return self._reveal_results(self._keyword_search(query, limit, namespace))
+            fallback = self._keyword_search(query, limit, namespace, content_type)
+            return self._reveal_results(fallback)
 
         # Mark accessed (and reinforce retrieved memories, if enabled)
         for r in results[:limit]:
@@ -1023,7 +1060,7 @@ class ZettelMemory:
         if not self._backend.needs_rebuild or not self._zettels:
             return
         ids = list(self._zettels.keys())
-        texts = [self._zettels[zid].content for zid in ids]
+        texts = [self._zettels[zid].index_text for zid in ids]
         self._backend.build_index(ids, texts)
 
     def _link_zettel(self, new_zettel: Zettel) -> None:
@@ -1032,7 +1069,7 @@ class ZettelMemory:
         Links are only created within the new zettel's namespace — similarity
         across namespaces must never leak into the graph.
         """
-        similar = self._backend.find_similar(new_zettel.content, self.connection_threshold)
+        similar = self._backend.find_similar(new_zettel.index_text, self.connection_threshold)
         for zid, _sim in similar:
             existing = self._zettels.get(zid)
             if existing is None or existing.namespace != new_zettel.namespace:
@@ -1041,7 +1078,11 @@ class ZettelMemory:
             existing.connections.add(new_zettel.id)
 
     def _keyword_search(
-        self, query: str, limit: int, namespace: str | None = None
+        self,
+        query: str,
+        limit: int,
+        namespace: str | None = None,
+        content_type: str | None = None,
     ) -> list[SearchResult]:
         """Fallback search when the backend produces no results."""
         query_words = set(query.lower().split())
@@ -1050,7 +1091,9 @@ class ZettelMemory:
         for zettel in self._zettels.values():
             if namespace is not None and zettel.namespace != namespace:
                 continue
-            words = set(zettel.content.lower().split())
+            if content_type is not None and zettel.content_type != content_type:
+                continue
+            words = set(zettel.index_text.lower().split())
             overlap = len(query_words & words)
             if overlap > 0:
                 score = overlap / max(len(query_words), 1)

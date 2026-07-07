@@ -306,13 +306,19 @@ class ZettelSMCPServer:
                 params.get("tags"),
                 float(params.get("importance", 0.5)),
                 params.get("metadata"),
+                str(params.get("content_type", "text")),
+                params.get("search_text"),
                 namespace=namespace,
             )
             self._persist()
             return result
         if tool_name == "memory_search":
             return _tools.search(
-                mem, str(params["query"]), int(params.get("limit", 5)), namespace=namespace
+                mem,
+                str(params["query"]),
+                int(params.get("limit", 5)),
+                params.get("content_type"),
+                namespace=namespace,
             )
         if tool_name == "memory_get":
             return _tools.get(mem, str(params["memory_id"]), namespace=namespace)

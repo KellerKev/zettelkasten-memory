@@ -747,7 +747,7 @@ Here's what's planned for future releases:
 - ~~**Streaming persistence**~~ ✅ — append-only journal (`enable_journal`) with automatic crash-recovery replay on load and compaction on save; records encrypted per-line when a key is set
 - ~~**Memory consolidation**~~ ✅ — `consolidate(summarize_fn)` merges near-duplicate clusters (connected components above a similarity threshold) into one summarised memory; dry run by default
 - ~~**Importance decay and reinforcement**~~ ✅ — opt-in read-time importance decay for unused memories and reinforcement for frequently-retrieved ones (`importance_half_life_days`, `reinforcement`)
-- **Multi-modal zettels** — support images, code snippets, and structured data as first-class zettel content alongside text
+- ~~**Multi-modal zettels**~~ ✅ — `content_type` labels content ("text"/"code"/"data"/"image"/…) and filters search; `search_text` indexes non-text content (e.g. an image path) by a caption. Cross-modal embedding is a future refinement
 - ~~**Graph visualisation**~~ ✅ — `export_graph(fmt="dot"|"html")` writes the link graph as Graphviz DOT or a self-contained HTML/SVG page (namespace-scoped)
 - **Vector database backends** — ✅ FAISS (`FaissBackend`, exact + HNSW); Qdrant, ChromaDB, and Pinecone still planned for scaling beyond in-memory limits
 - ~~**Claude Code memory commands**~~ ✅ — higher-level tools `memory_reflect` (gather what you know about topic X to summarise) and `memory_prune` (find/delete stale entries, dry run by default), exposed over MCP and SMCP

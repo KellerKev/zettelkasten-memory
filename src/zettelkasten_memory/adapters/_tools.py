@@ -119,6 +119,8 @@ def store(
     tags: list[str] | None = None,
     importance: float = 0.5,
     metadata: dict[str, str] | None = None,
+    content_type: str = "text",
+    search_text: str | None = None,
     *,
     namespace: str,
 ) -> dict[str, Any]:
@@ -128,6 +130,8 @@ def store(
         importance=importance,
         metadata=metadata or {},
         namespace=namespace,
+        content_type=content_type or "text",
+        search_text=search_text,
     )
     return {
         "id": zettel.id,
@@ -137,10 +141,15 @@ def store(
 
 
 def search(
-    mem: ZettelMemory, query: str, limit: int = 5, *, namespace: str
+    mem: ZettelMemory,
+    query: str,
+    limit: int = 5,
+    content_type: str | None = None,
+    *,
+    namespace: str,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), MAX_LIMIT))
-    results = mem.search(query, limit=limit, namespace=namespace)
+    results = mem.search(query, limit=limit, namespace=namespace, content_type=content_type)
     return [
         {
             "id": r.zettel.id,
@@ -236,6 +245,8 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
             "tags": {"type": "array", "items": "string"},
             "importance": {"type": "number", "default": 0.5},
             "metadata": {"type": "object"},
+            "content_type": {"type": "string", "default": "text"},
+            "search_text": {"type": "string"},
         },
     },
     "memory_search": {
@@ -243,6 +254,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "parameters": {
             "query": {"type": "string", "required": True},
             "limit": {"type": "integer", "default": 5},
+            "content_type": {"type": "string"},
         },
     },
     "memory_get": {

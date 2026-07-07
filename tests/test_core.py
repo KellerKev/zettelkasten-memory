@@ -513,6 +513,45 @@ def test_consolidate_merges_cluster():
 
 
 # ------------------------------------------------------------------
+# Multi-modal zettels (content_type + search_text)
+# ------------------------------------------------------------------
+
+
+def test_content_type_filter():
+    mem = ZettelMemory()
+    mem.add("def add(a, b): return a + b", content_type="code")
+    mem.add("the user prefers dark mode add-ons", content_type="text")
+    code = mem.search("add", content_type="code")
+    assert code and all(r.zettel.content_type == "code" for r in code)
+    text = mem.search("add", content_type="text")
+    assert text and all(r.zettel.content_type == "text" for r in text)
+
+
+def test_search_text_indexes_non_text_content():
+    mem = ZettelMemory()
+    # an image: content is the path, but it's searchable by its caption
+    img = mem.add(
+        "/assets/architecture.png",
+        content_type="image",
+        search_text="system architecture diagram: FastAPI gateway to PostgreSQL",
+    )
+    hits = mem.search("architecture diagram")
+    assert hits and hits[0].zettel.id == img.id
+    assert hits[0].zettel.content == "/assets/architecture.png"  # raw content preserved
+
+
+def test_content_type_and_search_text_roundtrip(tmp_path):
+    mem = ZettelMemory()
+    z = mem.add("/img/x.png", content_type="image", search_text="a cat on a mat")
+    path = tmp_path / "mm.json"
+    mem.save(path)
+    loaded = ZettelMemory.load(path)
+    got = loaded.get(z.id)
+    assert got.content_type == "image"
+    assert got.search_text == "a cat on a mat"
+
+
+# ------------------------------------------------------------------
 # Embedding backend tests (real Ollama embeddings)
 # ------------------------------------------------------------------
 
