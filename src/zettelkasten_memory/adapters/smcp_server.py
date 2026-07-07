@@ -437,6 +437,14 @@ def main() -> None:
     parser.add_argument("--base-url", type=str, default=None, help="Base URL for ollama/malgra")
     parser.add_argument("--compress", action="store_true", default=False)
     parser.add_argument(
+        "--backend",
+        type=str,
+        default="embedding",
+        choices=["embedding", "hybrid", "faiss"],
+        help="Index type for provider embeddings: embedding|hybrid|faiss",
+    )
+    parser.add_argument("--faiss-index", type=str, default="flat", choices=["flat", "hnsw"])
+    parser.add_argument(
         "--encrypt",
         action="store_true",
         default=False,
@@ -487,6 +495,8 @@ def main() -> None:
         account=args.account,
         base_url=args.base_url,
         compression=args.compress,
+        backend_type=args.backend,
+        faiss_index=args.faiss_index,
     )
     memory = _tools.build_memory(args.persist, backend, camouflage=camouflage)
     server = ZettelSMCPServer(memory, config, args.persist, encrypt=encrypt)

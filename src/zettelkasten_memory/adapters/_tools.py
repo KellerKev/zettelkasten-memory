@@ -35,12 +35,20 @@ def build_backend(
     account: str | None = None,
     base_url: str | None = None,
     compression: bool = False,
+    backend_type: str = "embedding",
+    faiss_index: str = "flat",
 ):
     """Construct a search backend from server options.
 
-    Credentials are read from environment variables by the providers
-    themselves (OPENAI_API_KEY, SNOWFLAKE_PAT_TOKEN, MALGRA_AGENT_JWT, ...);
-    secrets are never accepted as parameters here.
+    *backend_type* selects how the provider's embeddings are indexed:
+
+    - ``"embedding"`` (default): brute-force in-memory ``EmbeddingBackend``.
+    - ``"hybrid"``: ``HybridBackend`` fusing TF-IDF + embeddings (RRF).
+    - ``"faiss"``: ``FaissBackend`` (``faiss_index`` = ``"flat"``|``"hnsw"``).
+
+    With no provider (``tfidf``/None) a plain ``TfidfBackend`` is returned and
+    *backend_type* is ignored. Credentials are read from environment variables
+    by the providers themselves; secrets are never accepted as parameters here.
     """
     if provider is None or provider == "tfidf":
         return TfidfBackend()
@@ -56,6 +64,15 @@ def build_backend(
         kwargs["base_url"] = base_url
 
     embed_fn = get_provider(provider, **kwargs)
+
+    if backend_type == "hybrid":
+        from zettelkasten_memory.backends import HybridBackend
+
+        return HybridBackend(embed_fn=embed_fn)
+    if backend_type == "faiss":
+        from zettelkasten_memory.backends import FaissBackend
+
+        return FaissBackend(embed_fn=embed_fn, index=faiss_index)
 
     compressor = None
     if compression:

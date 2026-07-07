@@ -319,6 +319,21 @@ Secrets are read from environment variables only:
         help="Enable TurboQuant vector compression (reduces storage 3-8x)",
     )
     parser.add_argument(
+        "--backend",
+        type=str,
+        default="embedding",
+        choices=["embedding", "hybrid", "faiss"],
+        help="How to index a provider's embeddings: embedding (default), "
+        "hybrid (TF-IDF+embeddings via RRF), or faiss (scalable ANN)",
+    )
+    parser.add_argument(
+        "--faiss-index",
+        type=str,
+        default="flat",
+        choices=["flat", "hnsw"],
+        help="With --backend faiss: exact 'flat' (default) or approximate 'hnsw'",
+    )
+    parser.add_argument(
         "--namespace",
         type=str,
         default=None,
@@ -378,6 +393,8 @@ Secrets are read from environment variables only:
         account=args.account,
         base_url=args.base_url,
         compression=args.compress,
+        backend_type=args.backend,
+        faiss_index=args.faiss_index,
     )
 
     server = create_mcp_server(

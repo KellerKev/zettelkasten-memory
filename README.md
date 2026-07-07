@@ -443,6 +443,8 @@ Server flags:
 | `--account ACCT` | Snowflake account identifier (`orgname-accountname`) |
 | `--base-url URL` | Base URL for `ollama`/`malgra` providers |
 | `--compress` | Enable TurboQuant vector compression |
+| `--backend NAME` | Index type for provider embeddings: `embedding` (default), `hybrid` (TF-IDF+embeddings via RRF), `faiss` (scalable ANN) |
+| `--faiss-index` | With `--backend faiss`: `flat` (exact, default) or `hnsw` (approximate) |
 | `--namespace NS` | Bind this server to one namespace (or `ZETTEL_NAMESPACE`) |
 | `--encrypt` | Require AES-256-GCM at rest (`ZETTEL_MEMORY_*` env vars) |
 | `--camouflage` | Tokenize PII before indexing/persisting (`ZETTEL_PII_KEY`) |

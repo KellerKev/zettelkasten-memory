@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zettelkasten-memory"
-version = "0.2.0"
+version = "0.3.0"
 description = "Zettelkasten-inspired semantic memory for AI agents — works with CrewAI, LangGraph, and Claude Code (MCP)"
 authors = [
     {name = "Kevin Keller", email = "kellerkev@gmail.com"},

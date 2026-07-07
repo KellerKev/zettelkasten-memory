@@ -83,6 +83,27 @@ def test_build_backend_ollama_compressed():
     assert backend._compressor is not None
 
 
+def test_build_backend_hybrid():
+    from zettelkasten_memory.backends import HybridBackend
+
+    backend = build_backend("ollama", backend_type="hybrid")
+    assert isinstance(backend, HybridBackend)
+
+
+def test_build_backend_faiss():
+    pytest.importorskip("faiss")
+    from zettelkasten_memory.backends import FaissBackend
+
+    backend = build_backend("ollama", backend_type="faiss", faiss_index="hnsw")
+    assert isinstance(backend, FaissBackend)
+    assert backend.index_type == "hnsw"
+
+
+def test_build_backend_tfidf_ignores_backend_type():
+    # no provider -> plain TF-IDF regardless of backend_type
+    assert isinstance(build_backend("tfidf", backend_type="hybrid"), TfidfBackend)
+
+
 def test_build_backend_openai_env_token(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     backend = build_backend("openai")
