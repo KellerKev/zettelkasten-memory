@@ -383,6 +383,69 @@ async def test_async_writes_are_serialized():
 
 
 # ------------------------------------------------------------------
+# Streaming persistence (append-only journal)
+# ------------------------------------------------------------------
+
+
+def test_journal_crash_recovery(tmp_path):
+    path = tmp_path / "mem.json"
+    mem = ZettelMemory()
+    mem.save(path)  # initial snapshot
+    mem.enable_journal(path)
+    a = mem.add("FastAPI powers the REST API")
+    b = mem.add("PostgreSQL is the primary database")
+    # simulate a crash: no final save() — reload from snapshot + journal
+    recovered = ZettelMemory.load(path)
+    assert {a.id, b.id} <= set(recovered._zettels)
+
+
+def test_journal_delete_replayed(tmp_path):
+    path = tmp_path / "mem.json"
+    mem = ZettelMemory()
+    mem.save(path)
+    mem.enable_journal(path)
+    a = mem.add("note one")
+    mem.add("note two")
+    mem.delete(a.id)
+    recovered = ZettelMemory.load(path)
+    assert a.id not in recovered._zettels
+    assert len(recovered._zettels) == 1
+
+
+def test_save_compacts_journal(tmp_path):
+    path = tmp_path / "mem.json"
+    mem = ZettelMemory()
+    mem.save(path)
+    mem.enable_journal(path)
+    mem.add("a note")
+    assert (tmp_path / "mem.json.jrnl").stat().st_size > 0
+    mem.save(path)  # compaction point
+    assert (tmp_path / "mem.json.jrnl").stat().st_size == 0
+    # snapshot alone (empty journal) still has everything
+    assert len(ZettelMemory.load(path)._zettels) == 1
+
+
+def test_encrypted_journal_records(tmp_path, monkeypatch):
+    pytest.importorskip("cryptography")
+    import os as _os
+
+    from zettelkasten_memory.crypto import ENV_KEY
+
+    monkeypatch.setenv(ENV_KEY, _os.urandom(32).hex())
+    path = tmp_path / "enc.bin"
+    mem = ZettelMemory()
+    mem.save(path)
+    mem.enable_journal(path)
+    z = mem.add("secret note about the gateway")
+
+    line = (tmp_path / "enc.bin.jrnl").read_text().splitlines()[0]
+    assert not line.startswith("{")  # encrypted, not plaintext JSON
+    assert "gateway" not in line  # no plaintext leak in the journal
+    recovered = ZettelMemory.load(path)
+    assert z.id in recovered._zettels
+
+
+# ------------------------------------------------------------------
 # Embedding backend tests (real Ollama embeddings)
 # ------------------------------------------------------------------
 

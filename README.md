@@ -640,6 +640,24 @@ value = importance * (1 + access_count) * recency
 
 JSON file with all zettels, config, backend type, and embedding vectors. When using `EmbeddingBackend`, vectors are persisted (as float16 or compressed via TurboQuant) so loading doesn't require re-embedding. Load/save are explicit — no background I/O.
 
+### Streaming persistence (journal)
+
+For large stores where rewriting the whole file on every change is costly,
+enable an append-only journal:
+
+```python
+mem.save("mem.json")          # snapshot
+mem.enable_journal("mem.json")  # journal file: mem.json.jrnl
+mem.add("...")                 # appended to the journal (fsync'd), no full rewrite
+# ... crash here ...
+mem = ZettelMemory.load("mem.json")  # snapshot + journal replayed automatically
+mem.save("mem.json")           # compaction: writes a fresh snapshot, clears the journal
+```
+
+Each record is encrypted per line when encryption key material is configured
+(no plaintext PII in the journal). Only structural add/delete operations are
+journaled; access-time metadata is persisted at the next `save`.
+
 ---
 
 ## Configuration
@@ -708,7 +726,7 @@ Here's what's planned for future releases:
 - ~~**SMCP server**~~ ✅ — authenticated + encrypted tool channel, identity-bound namespaces
 - ~~**Hybrid search**~~ ✅ — `HybridBackend` fuses TF-IDF keyword matching with embedding similarity via reciprocal rank fusion
 - ~~**Async embedding backend**~~ ✅ — non-blocking `aadd`/`asearch`/`aget_context` (offload to a worker thread so a blocking embedding call doesn't stall the event loop); the LangGraph adapter uses them
-- **Streaming persistence** — incremental writes instead of full JSON dumps, for large memory stores
+- ~~**Streaming persistence**~~ ✅ — append-only journal (`enable_journal`) with automatic crash-recovery replay on load and compaction on save; records encrypted per-line when a key is set
 - **Memory consolidation** — automatically merge near-duplicate zettels and summarise clusters to stay within capacity without losing information
 - ~~**Importance decay and reinforcement**~~ ✅ — opt-in read-time importance decay for unused memories and reinforcement for frequently-retrieved ones (`importance_half_life_days`, `reinforcement`)
 - **Multi-modal zettels** — support images, code snippets, and structured data as first-class zettel content alongside text

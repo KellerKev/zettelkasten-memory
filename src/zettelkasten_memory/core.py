@@ -15,6 +15,7 @@ with a keyword fallback.  Connected zettels are boosted in search results
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -143,6 +144,9 @@ class ZettelMemory:
         self._zettels: dict[str, Zettel] = {}
         self._camouflage = camouflage
         self._async_lock: asyncio.Lock | None = None
+        self._journal_path: Path | None = None
+        self._journal_key: bytes | str | None = None
+        self._journal_encrypt = False
 
     # ------------------------------------------------------------------
     # Camouflage helpers
@@ -257,6 +261,16 @@ class ZettelMemory:
 
         self._zettels[zid] = zettel
         self._backend.needs_rebuild = True
+
+        # Journal the new zettel plus any neighbors whose connections it changed
+        # (their back-references were added just now by _link_zettel).
+        if self._journal_path is not None:
+            touched = [zettel.to_dict()]
+            for cid in zettel.connections:
+                nb = self._zettels.get(cid)
+                if nb is not None:
+                    touched.append(nb.to_dict())
+            self._journal_write({"op": "upsert", "zettels": touched})
 
         # Evict if over capacity
         if len(self._zettels) > self.max_zettels:
@@ -448,6 +462,7 @@ class ZettelMemory:
 
         del self._zettels[zettel_id]
         self._backend.needs_rebuild = True
+        self._journal_write({"op": "delete", "id": zettel_id})
         return True
 
     def get_connected(
@@ -647,6 +662,76 @@ class ZettelMemory:
         }
 
     # ------------------------------------------------------------------
+    # Streaming persistence (append-only journal)
+    # ------------------------------------------------------------------
+
+    def enable_journal(self, path: str | Path, *, key: bytes | str | None = None) -> None:
+        """Append structural changes (add/delete) to a journal for durability
+        between full saves — so a large store doesn't rewrite everything on
+        every write.
+
+        The journal lives next to the store at ``<path>.jrnl``. ``save(path)``
+        is the compaction point (writes the full snapshot and clears the
+        journal), and ``load(path)`` replays a present journal automatically, so
+        changes since the last save survive a crash. Each record is encrypted
+        per line when encryption key material is configured (same resolution as
+        ``save``).
+
+        Note: only structural add/delete operations are journaled; access-time
+        metadata (access_count/recency/reinforcement) is persisted at the next
+        ``save``. Enabling does not clear an existing journal.
+        """
+        from . import crypto
+
+        self._journal_path = Path(str(path) + ".jrnl")
+        self._journal_key = key
+        self._journal_encrypt = crypto.encryption_available(key)
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _journal_write(self, record: dict[str, Any]) -> None:
+        if self._journal_path is None:
+            return
+        line = json.dumps(record, default=str)
+        if self._journal_encrypt:
+            from . import crypto
+
+            blob = crypto.encrypt_bytes(line.encode("utf-8"), key=self._journal_key)
+            line = base64.b64encode(blob).decode("ascii")
+        with open(self._journal_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _replay_journal(self, journal_path: Path, *, key: bytes | str | None = None) -> None:
+        from . import crypto
+
+        for raw in journal_path.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                if raw[0] != "{":  # not plaintext JSON -> encrypted base64 line
+                    raw = crypto.decrypt_bytes(base64.b64decode(raw), key=key).decode("utf-8")
+                record = json.loads(raw)
+            except Exception:
+                # a torn/unreadable trailing record (e.g. crash mid-write) —
+                # stop replaying rather than corrupt the reconstructed state
+                break
+            op = record.get("op")
+            if op == "upsert":
+                for zd in record.get("zettels", []):
+                    self._zettels[zd["id"]] = Zettel.from_dict(zd)
+            elif op == "delete":
+                zid = record.get("id")
+                z = self._zettels.pop(zid, None)
+                if z is not None:
+                    for cid in z.connections:
+                        nb = self._zettels.get(cid)
+                        if nb is not None:
+                            nb.connections.discard(zid)
+        self._backend.needs_rebuild = True
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -715,6 +800,12 @@ class ZettelMemory:
         tmp.write_bytes(payload)
         os.replace(tmp, path)
 
+        # This snapshot IS the compaction point: clear the journal for this
+        # store so replay on next load doesn't double-apply already-saved ops.
+        journal = Path(str(path) + ".jrnl")
+        if journal.exists():
+            journal.write_text("", encoding="utf-8")
+
     @classmethod
     def load(
         cls,
@@ -769,6 +860,13 @@ class ZettelMemory:
             )
         for zd in data.get("zettels", []):
             mem._zettels[zd["id"]] = Zettel.from_dict(zd)
+
+        # Replay a journal of changes made since the last snapshot (crash
+        # recovery / streaming persistence). Ops appended after this snapshot
+        # are applied in order on top of it.
+        journal = Path(str(path) + ".jrnl")
+        if journal.exists() and journal.stat().st_size > 0:
+            mem._replay_journal(journal, key=key)
 
         # Only force rebuild if the backend didn't restore vectors from persistence.
         # EmbeddingBackend.from_dict sets _dirty=False when vectors are loaded;
