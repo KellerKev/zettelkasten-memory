@@ -183,6 +183,26 @@ the store, so a reload restores the hybrid config and vectors.
 | `EmbeddingBackend` | Embedding vectors + normalised dot product | Full semantic search | An embedding provider or function |
 | `EmbeddingBackend` + `TurboQuantCompressor` | Same, with compressed storage | Full semantic, <2% recall loss | Provider + `compressor=` flag |
 | `HybridBackend` | TF-IDF + embeddings fused with reciprocal rank fusion | Keyword **and** semantic | An embedding provider or function |
+| `FaissBackend` | Embeddings in a FAISS index (exact `flat` or approximate `hnsw`) | Full semantic, scales to large stores | Provider/function + `pip install ...[faiss]` |
+
+### FAISS Backend (scale)
+
+For stores too large for the brute-force in-memory backend, `FaissBackend`
+keeps embeddings in a [FAISS](https://github.com/facebookresearch/faiss) index.
+Default `index="flat"` is exact (same results as `EmbeddingBackend`, via FAISS's
+compact optimised index); `index="hnsw"` is an approximate graph that scales to
+very large stores (each query returns the top `search_k` candidates, which the
+composite score then reranks). The built index serialises with the store, so a
+reload restores it without re-embedding.
+
+```python
+from zettelkasten_memory import ZettelMemory, FaissBackend
+
+mem = ZettelMemory(backend=FaissBackend(embed_fn=my_embed_fn))              # exact
+mem = ZettelMemory(backend=FaissBackend.from_provider("ollama", index="hnsw"))  # approximate, scalable
+```
+
+Install the extra: `pip install zettelkasten-memory[faiss]`.
 
 ---
 
@@ -682,7 +702,7 @@ Here's what's planned for future releases:
 - ~~**Importance decay and reinforcement**~~ ✅ — opt-in read-time importance decay for unused memories and reinforcement for frequently-retrieved ones (`importance_half_life_days`, `reinforcement`)
 - **Multi-modal zettels** — support images, code snippets, and structured data as first-class zettel content alongside text
 - **Graph visualisation** — export the zettel link graph to formats like DOT/Graphviz or interactive HTML for exploring memory structure
-- **Vector database backends** — pluggable storage backends using FAISS, Qdrant, ChromaDB, or Pinecone for scaling beyond in-memory limits
+- **Vector database backends** — ✅ FAISS (`FaissBackend`, exact + HNSW); Qdrant, ChromaDB, and Pinecone still planned for scaling beyond in-memory limits
 - ~~**Claude Code memory commands**~~ ✅ — higher-level tools `memory_reflect` (gather what you know about topic X to summarise) and `memory_prune` (find/delete stale entries, dry run by default), exposed over MCP and SMCP
 
 ---

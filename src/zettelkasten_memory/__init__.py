@@ -4,7 +4,13 @@ Zettelkasten-inspired semantic memory for AI agents.
 Works standalone or as a plugin for CrewAI, LangGraph, and Claude Code (MCP).
 """
 
-from .backends import EmbeddingBackend, HybridBackend, SearchBackend, TfidfBackend
+from .backends import (
+    EmbeddingBackend,
+    FaissBackend,
+    HybridBackend,
+    SearchBackend,
+    TfidfBackend,
+)
 from .camouflage import CamouflageCodec, CamouflageError
 from .compression import CompressedVectors, TurboQuantCompressor
 from .core import SearchResult, Zettel, ZettelMemory
@@ -27,6 +33,7 @@ __all__ = [
     "CompressedVectors",
     "EmbeddingBackend",
     "EncryptionError",
+    "FaissBackend",
     "HybridBackend",
     "KeyNotFoundError",
     "MalgraEmbeddings",

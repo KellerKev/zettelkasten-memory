@@ -557,6 +557,183 @@ class HybridBackend:
 
 
 # ------------------------------------------------------------------
+# FAISS backend
+# ------------------------------------------------------------------
+
+
+def _require_faiss():
+    try:
+        import faiss
+
+        return faiss
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "the 'faiss-cpu' package is required for FaissBackend. "
+            "Install with: pip install 'zettelkasten-memory[faiss]'"
+        ) from exc
+
+
+class FaissBackend:
+    """Semantic search backed by a FAISS index — scales past the brute-force
+    in-memory backend.
+
+    Cosine similarity via inner product on L2-normalised embeddings. Two index
+    types:
+
+    - ``"flat"`` (default): exact inner-product search — same results as
+      ``EmbeddingBackend`` but through FAISS's optimised, compact index.
+    - ``"hnsw"``: approximate nearest-neighbour graph that scales to very large
+      stores; each query returns the top ``search_k`` candidates (the composite
+      score then reranks those).
+
+    The built index serialises with the store, so a reload restores it without
+    re-embedding (``embed_fn`` is only needed to add/search new text).
+
+    Requires ``faiss-cpu`` (extra: ``zettelkasten-memory[faiss]``).
+    """
+
+    def __init__(
+        self,
+        embed_fn: EmbedFn | None = None,
+        *,
+        batch_size: int = 64,
+        index: str = "flat",
+        hnsw_m: int = 32,
+        search_k: int = 64,
+    ) -> None:
+        _require_faiss()
+        if index not in ("flat", "hnsw"):
+            raise ValueError("index must be 'flat' or 'hnsw'")
+        self._embed_fn = embed_fn
+        self.batch_size = batch_size
+        self.index_type = index
+        self.hnsw_m = int(hnsw_m)
+        self.search_k = int(search_k)
+        self._index = None
+        self._id_order: list[str] = []
+        self._dim: int | None = None
+        self._dirty = True
+
+    @classmethod
+    def from_provider(cls, provider: str, **kwargs: Any) -> "FaissBackend":
+        from .providers import get_provider
+
+        index = kwargs.pop("index", "flat")
+        return cls(embed_fn=get_provider(provider, **kwargs), index=index)
+
+    # -- protocol -------------------------------------------------
+
+    @property
+    def needs_rebuild(self) -> bool:
+        return self._dirty
+
+    @needs_rebuild.setter
+    def needs_rebuild(self, value: bool) -> None:
+        self._dirty = value
+
+    def _new_index(self, dim: int):
+        faiss = _require_faiss()
+        if self.index_type == "hnsw":
+            return faiss.IndexHNSWFlat(dim, self.hnsw_m, faiss.METRIC_INNER_PRODUCT)
+        return faiss.IndexFlatIP(dim)
+
+    def _embed_norm(self, texts: list[str]) -> np.ndarray:
+        vecs = np.asarray(self._embed_fn(texts), dtype=np.float32)  # type: ignore[misc]
+        if vecs.ndim == 1:
+            vecs = vecs.reshape(1, -1)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return (vecs / norms).astype(np.float32)
+
+    def build_index(self, ids: list[str], texts: list[str]) -> None:
+        if not ids:
+            self._index = None
+            self._id_order = []
+            self._dirty = False
+            return
+        if self._embed_fn is None:
+            # can't (re)embed without a function; keep any loaded index as-is
+            self._dirty = False
+            return
+        vecs = self._embed_norm(texts)
+        self._dim = int(vecs.shape[1])
+        index = self._new_index(self._dim)
+        index.add(vecs)
+        self._index = index
+        self._id_order = list(ids)
+        self._dirty = False
+
+    def _search(self, text: str, k: int) -> list[tuple[str, float]]:
+        if self._index is None or not self._id_order or self._embed_fn is None:
+            return []
+        q = self._embed_norm([text])
+        k = max(1, min(k, len(self._id_order)))
+        scores, idxs = self._index.search(q, k)
+        out: list[tuple[str, float]] = []
+        for score, i in zip(scores[0], idxs[0]):
+            if i == -1:
+                continue
+            out.append((self._id_order[int(i)], float(score)))
+        return out
+
+    def query(self, text: str) -> list[tuple[str, float]]:
+        # flat is exact, so return every positive match; hnsw returns top-k
+        k = len(self._id_order) if self.index_type == "flat" else self.search_k
+        return [(zid, s) for zid, s in self._search(text, k) if s > 0.0]
+
+    def find_similar(self, text: str, threshold: float) -> list[tuple[str, float]]:
+        k = len(self._id_order) if self.index_type == "flat" else self.search_k
+        return [(zid, s) for zid, s in self._search(text, k) if s >= threshold]
+
+    def extract_tags(self, text: str) -> set[str]:
+        try:
+            vec = TfidfVectorizer(max_features=200, stop_words="english")
+            tfidf = vec.fit_transform([text])
+            names = vec.get_feature_names_out()
+            scores = tfidf.toarray()[0]
+            top = scores.argsort()[-5:][::-1]
+            return {names[i] for i in top if scores[i] > 0}
+        except Exception:
+            return set()
+
+    # -- persistence ------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "type": "faiss",
+            "batch_size": self.batch_size,
+            "index_type": self.index_type,
+            "hnsw_m": self.hnsw_m,
+            "search_k": self.search_k,
+        }
+        if self._index is not None and self._id_order:
+            faiss = _require_faiss()
+            blob = faiss.serialize_index(self._index)
+            result["index"] = base64.b64encode(bytes(blob)).decode()
+            result["id_order"] = self._id_order
+            result["dim"] = self._dim
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], embed_fn: EmbedFn | None = None) -> "FaissBackend":
+        instance = cls(
+            embed_fn=embed_fn,
+            batch_size=data.get("batch_size", 64),
+            index=data.get("index_type", "flat"),
+            hnsw_m=data.get("hnsw_m", 32),
+            search_k=data.get("search_k", 64),
+        )
+        if "index" in data and data.get("id_order"):
+            faiss = _require_faiss()
+            raw = np.frombuffer(base64.b64decode(data["index"]), dtype=np.uint8)
+            instance._index = faiss.deserialize_index(raw)
+            instance._id_order = data["id_order"]
+            instance._dim = data.get("dim")
+            instance._dirty = False
+        return instance
+
+
+# ------------------------------------------------------------------
 # Registry — resolve backend type string to class
 # ------------------------------------------------------------------
 
@@ -564,6 +741,7 @@ BACKEND_REGISTRY: dict[str, type] = {
     "tfidf": TfidfBackend,
     "embedding": EmbeddingBackend,
     "hybrid": HybridBackend,
+    "faiss": FaissBackend,
 }
 
 
@@ -573,6 +751,6 @@ def backend_from_dict(data: dict[str, Any], **kwargs: Any) -> SearchBackend:
     cls = BACKEND_REGISTRY.get(btype)
     if cls is None:
         raise ValueError(f"Unknown backend type: {btype!r}")
-    if btype in ("embedding", "hybrid"):
+    if btype in ("embedding", "hybrid", "faiss"):
         return cls.from_dict(data, embed_fn=kwargs.get("embed_fn"))  # type: ignore[arg-type]
     return cls.from_dict(data)

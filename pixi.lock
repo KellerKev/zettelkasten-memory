@@ -1783,6 +1783,7 @@ packages:
   - cohere>=5.0.0 ; extra == 'providers-cohere'
   - voyageai>=0.3.0 ; extra == 'providers-voyage'
   - sentence-transformers>=2.0.0 ; extra == 'providers-local'
+  - faiss-cpu>=1.7.0 ; extra == 'faiss'
   - openai>=1.0.0 ; extra == 'all-providers'
   - cohere>=5.0.0 ; extra == 'all-providers'
   - voyageai>=0.3.0 ; extra == 'all-providers'

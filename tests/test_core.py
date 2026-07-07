@@ -319,6 +319,42 @@ def test_hybrid_backend_roundtrip(tmp_path):
 
 
 # ------------------------------------------------------------------
+# FAISS backend tests (skipped if faiss-cpu is not installed)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("index", ["flat", "hnsw"])
+def test_faiss_backend_search_and_roundtrip(index, tmp_path):
+    pytest.importorskip("faiss")
+    from zettelkasten_memory import FaissBackend
+    from zettelkasten_memory.backends import SearchBackend
+
+    backend = FaissBackend(embed_fn=_fake_embed, index=index)
+    assert isinstance(backend, SearchBackend)
+
+    mem = ZettelMemory(backend=backend)
+    mem.add("The project uses FastAPI for the REST API")
+    mem.add("PostgreSQL is the primary database")
+    results = mem.search("database", limit=3)
+    assert results and "PostgreSQL" in results[0].zettel.content
+
+    # the serialised FAISS index reloads without re-embedding
+    path = tmp_path / f"faiss_{index}.json"
+    mem.save(path)
+    loaded = ZettelMemory.load(path, embed_fn=_fake_embed)
+    assert loaded._backend.to_dict()["type"] == "faiss"
+    assert loaded.search("FastAPI REST", limit=2)
+
+
+def test_faiss_backend_rejects_bad_index():
+    pytest.importorskip("faiss")
+    from zettelkasten_memory import FaissBackend
+
+    with pytest.raises(ValueError):
+        FaissBackend(embed_fn=_fake_embed, index="bogus")
+
+
+# ------------------------------------------------------------------
 # Embedding backend tests (real Ollama embeddings)
 # ------------------------------------------------------------------
 
