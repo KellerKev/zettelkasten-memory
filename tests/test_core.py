@@ -446,6 +446,73 @@ def test_encrypted_journal_records(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------
+# Graph export
+# ------------------------------------------------------------------
+
+
+def test_export_graph_dot():
+    mem = ZettelMemory(connection_threshold=0.0)
+    a = mem.add("FastAPI powers the REST API endpoints")
+    b = mem.add("The REST API uses JWT authentication")
+    mem.search("api")  # trigger linking
+    dot = mem.export_graph(fmt="dot")
+    assert dot.startswith("graph zettel {")
+    assert a.id in dot and b.id in dot
+    assert "--" in dot  # at least one edge
+
+
+def test_export_graph_html_is_self_contained(tmp_path):
+    mem = ZettelMemory()
+    mem.add("a memory node")
+    path = tmp_path / "graph.html"
+    html = mem.export_graph(fmt="html", path=path)
+    assert "<svg" in html and "<circle" in html
+    assert "http://" not in html and "https://" not in html  # no external refs
+    assert path.read_text() == html
+
+
+def test_export_graph_namespace_scoped_and_bad_fmt():
+    mem = ZettelMemory()
+    mem.add("default note")
+    mem.add("tenant x secret", namespace="x")
+    assert "tenant x" not in mem.export_graph(fmt="dot", namespace="default")
+    with pytest.raises(ValueError):
+        mem.export_graph(fmt="bogus")
+
+
+# ------------------------------------------------------------------
+# Memory consolidation
+# ------------------------------------------------------------------
+
+
+def test_consolidate_dry_run_reports_without_changing():
+    mem = ZettelMemory(connection_threshold=0.0)
+    mem.add("the deployment uses docker containers on aws")
+    mem.add("the deployment uses docker containers on aws ecs")
+    mem.add("unrelated note about coffee")
+    res = mem.consolidate(lambda texts: "MERGED", min_similarity=0.5, dry_run=True)
+    assert res["dry_run"] is True and res["consolidated"] == 0
+    assert len(res["clusters"]) == 1 and res["clusters"][0]["size"] == 2
+    assert len(mem._zettels) == 3  # unchanged
+
+
+def test_consolidate_merges_cluster():
+    mem = ZettelMemory(connection_threshold=0.0)
+    mem.add("the deployment uses docker containers on aws")
+    mem.add("the deployment uses docker containers on aws ecs")
+    coffee = mem.add("unrelated note about coffee preferences")
+
+    def summarize(texts):
+        return f"Consolidated deployment note from {len(texts)} memories"
+
+    res = mem.consolidate(summarize, min_similarity=0.5, dry_run=False)
+    assert res["consolidated"] == 1 and res["removed"] == 2
+    assert len(mem._zettels) == 2  # cluster collapsed to one + the coffee note
+    assert coffee.id in mem._zettels
+    assert any("Consolidated deployment" in z.content for z in mem._zettels.values())
+
+
+# ------------------------------------------------------------------
 # Embedding backend tests (real Ollama embeddings)
 # ------------------------------------------------------------------
 

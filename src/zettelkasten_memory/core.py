@@ -549,6 +549,55 @@ class ZettelMemory:
 
         return "\n---\n".join(parts)
 
+    # ------------------------------------------------------------------
+    # Graph visualization
+    # ------------------------------------------------------------------
+
+    def _graph_nodes_edges(self, namespace: str | None, max_nodes: int):
+        """Collect (revealed) nodes and internal edges for the given scope."""
+        zettels = [
+            z for z in self._zettels.values() if namespace is None or z.namespace == namespace
+        ]
+        # most-connected first, so a capped view keeps the hubs
+        zettels.sort(key=lambda z: len(z.connections), reverse=True)
+        zettels = zettels[: max(1, max_nodes)]
+        ids = {z.id for z in zettels}
+        nodes = [self._reveal(z) for z in zettels]
+        seen: set[tuple[str, str]] = set()
+        edges: list[tuple[str, str]] = []
+        for z in zettels:
+            for cid in z.connections:
+                if cid in ids:
+                    pair = tuple(sorted((z.id, cid)))  # dedupe the bidirectional link
+                    if pair not in seen:
+                        seen.add(pair)
+                        edges.append(pair)  # type: ignore[arg-type]
+        return nodes, edges
+
+    def export_graph(
+        self,
+        *,
+        namespace: str | None = "default",
+        fmt: str = "dot",
+        max_nodes: int = 200,
+        path: str | Path | None = None,
+    ) -> str:
+        """Export the zettel link graph as Graphviz **DOT** or a self-contained
+        interactive **HTML** page.
+
+        Scoped to *namespace* (``None`` = all). Node labels are the memory's
+        content (detokenized when a camouflage codec is set). Capped at
+        *max_nodes*, keeping the most-connected zettels. Returns the text and,
+        if *path* is given, also writes it there.
+        """
+        if fmt not in ("dot", "html"):
+            raise ValueError("fmt must be 'dot' or 'html'")
+        nodes, edges = self._graph_nodes_edges(namespace, max_nodes)
+        out = _graph_to_dot(nodes, edges) if fmt == "dot" else _graph_to_html(nodes, edges)
+        if path is not None:
+            Path(path).write_text(out, encoding="utf-8")
+        return out
+
     @property
     def stats(self) -> dict[str, Any]:
         """Global memory statistics across every namespace.
@@ -659,6 +708,90 @@ class ZettelMemory:
             "matched": len(matched),
             "removed": removed,
             "candidates": candidates,
+        }
+
+    def consolidate(
+        self,
+        summarize_fn,
+        *,
+        namespace: str | None = "default",
+        min_similarity: float = 0.8,
+        min_cluster: int = 2,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Merge clusters of near-duplicate memories using an LLM summariser.
+
+        Groups memories whose pairwise similarity (from the backend) is at least
+        *min_similarity* into connected components; for each component of at
+        least *min_cluster* memories, ``summarize_fn(list[str]) -> str`` condenses
+        their contents into one, which replaces the cluster (their tags are
+        unioned and the highest importance kept). Scoped to *namespace*.
+
+        Defaults to a **dry run**: it reports the clusters it *would* merge
+        without calling *summarize_fn* or changing anything. Pass
+        ``dry_run=False`` to actually consolidate.
+
+        With a camouflage codec, *summarize_fn* sees the tokenized content (raw
+        PII never leaves the process), and the consolidated summary round-trips
+        the same tokens.
+        """
+        self._rebuild_index_if_needed()
+        scope = [z for z in self._zettels.values() if namespace is None or z.namespace == namespace]
+        ids = [z.id for z in scope]
+        id_set = set(ids)
+        parent = {i: i for i in ids}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for z in scope:
+            for cid, _sim in self._backend.find_similar(z.content, min_similarity):
+                if cid in id_set and cid != z.id:
+                    union(z.id, cid)
+
+        components: dict[str, list[str]] = {}
+        for i in ids:
+            components.setdefault(find(i), []).append(i)
+        groups = [g for g in components.values() if len(g) >= min_cluster]
+
+        clusters: list[dict[str, Any]] = []
+        consolidated = removed = 0
+        for g in groups:
+            zettels = [self._zettels[i] for i in g]
+            entry: dict[str, Any] = {"ids": list(g), "size": len(g)}
+            if not dry_run:
+                summary = summarize_fn([z.content for z in zettels])
+                tags: set[str] = set().union(*[z.tags for z in zettels]) if zettels else set()
+                importance = max(z.importance for z in zettels)
+                for z in zettels:
+                    if self.delete(z.id, namespace=None):
+                        removed += 1
+                new = self.add(
+                    summary,
+                    tags=tags,
+                    importance=importance,
+                    namespace=namespace or "default",
+                    metadata={"consolidated_from": len(g)},
+                )
+                entry["new_id"] = new.id
+                entry["summary"] = self._reveal(new).content
+                consolidated += 1
+            clusters.append(entry)
+
+        return {
+            "dry_run": dry_run,
+            "namespace": namespace,
+            "clusters": clusters,
+            "consolidated": consolidated,
+            "removed": removed,
         }
 
     # ------------------------------------------------------------------
@@ -955,3 +1088,108 @@ class ZettelMemory:
                 del by_namespace[largest]
             self.delete(zid, namespace=None)  # evict regardless of namespace
         self._backend.needs_rebuild = True
+
+
+# ------------------------------------------------------------------
+# Graph export helpers (module-level; no ZettelMemory state needed)
+# ------------------------------------------------------------------
+
+
+def _short_label(text: str, n: int = 40) -> str:
+    return " ".join(text.split())[:n]
+
+
+def _graph_to_dot(nodes: list[Zettel], edges: list[tuple[str, str]]) -> str:
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    lines = [
+        "graph zettel {",
+        '  node [shape=box style="rounded,filled" fillcolor="#eef"];',
+    ]
+    for z in nodes:
+        lines.append(f'  "{z.id}" [label="{esc(_short_label(z.content))}"];')
+    for a, b in edges:
+        lines.append(f'  "{a}" -- "{b}";')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _spring_layout(
+    node_ids: list[str], edges: list[tuple[str, str]], seed: int = 42, iters: int = 60
+) -> dict[str, tuple[float, float]]:
+    """Deterministic Fruchterman-Reingold layout in [0,1]^2 (seeded)."""
+    import numpy as np
+
+    n = len(node_ids)
+    if n == 0:
+        return {}
+    idx = {zid: i for i, zid in enumerate(node_ids)}
+    rng = np.random.default_rng(seed)
+    pos = rng.random((n, 2)) * 2 - 1
+    k = 1.0 / (n**0.5)
+    temp = 0.1
+    for _ in range(iters):
+        disp = np.zeros((n, 2))
+        for i in range(n):
+            delta = pos[i] - pos
+            dist = np.linalg.norm(delta, axis=1)
+            dist[i] = 1.0
+            dist = np.maximum(dist, 1e-3)
+            disp[i] += ((k * k / dist)[:, None] * (delta / dist[:, None])).sum(axis=0)
+        for a, b in edges:
+            ia, ib = idx[a], idx[b]
+            delta = pos[ia] - pos[ib]
+            dist = max(float(np.linalg.norm(delta)), 1e-3)
+            f = (dist * dist / k) * (delta / dist)
+            disp[ia] -= f
+            disp[ib] += f
+        length = np.maximum(np.linalg.norm(disp, axis=1), 1e-3)
+        pos += (disp / length[:, None]) * np.minimum(length, temp)[:, None]
+        temp *= 0.97
+    mn, mx = pos.min(axis=0), pos.max(axis=0)
+    span = np.maximum(mx - mn, 1e-6)
+    pos = (pos - mn) / span
+    return {zid: (float(pos[i][0]), float(pos[i][1])) for zid, i in idx.items()}
+
+
+def _graph_to_html(nodes: list[Zettel], edges: list[tuple[str, str]]) -> str:
+    import html as _html
+
+    W, H, PAD = 900, 640, 40
+    layout = _spring_layout([z.id for z in nodes], edges)
+
+    def xy(zid: str) -> tuple[float, float]:
+        x, y = layout.get(zid, (0.5, 0.5))
+        return PAD + x * (W - 2 * PAD), PAD + y * (H - 2 * PAD)
+
+    parts = []
+    for a, b in edges:
+        x1, y1 = xy(a)
+        x2, y2 = xy(b)
+        parts.append(
+            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+            'stroke="#bbb" stroke-width="1"/>'
+        )
+    for z in nodes:
+        x, y = xy(z.id)
+        r = 5 + min(len(z.connections), 12)
+        title = _html.escape(" ".join(z.content.split())[:120])
+        label = _html.escape(" ".join(z.content.split())[:24])
+        parts.append(
+            f"<g><title>{title}</title>"
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r}" fill="#5b8def" '
+            'fill-opacity="0.85" stroke="#274b8f"/>'
+            f'<text x="{x:.1f}" y="{y - r - 3:.1f}" font-size="9" '
+            f'text-anchor="middle" fill="#333">{label}</text></g>'
+        )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Zettel graph</title></head>"
+        "<body style='margin:0;font-family:system-ui,sans-serif'>"
+        f"<div style='padding:8px 12px'><b>Zettelkasten graph</b> — "
+        f"{len(nodes)} memories, {len(edges)} links</div>"
+        f"<svg width='{W}' height='{H}' viewBox='0 0 {W} {H}' style='background:#fafafa'>"
+        + "".join(parts)
+        + "</svg></body></html>\n"
+    )

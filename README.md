@@ -658,6 +658,24 @@ Each record is encrypted per line when encryption key material is configured
 (no plaintext PII in the journal). Only structural add/delete operations are
 journaled; access-time metadata is persisted at the next `save`.
 
+### Consolidation and visualization
+
+Merge near-duplicate memories with your own summariser, and export the link
+graph for inspection:
+
+```python
+# collapse clusters of near-duplicates into one summarised memory (dry run first)
+plan = mem.consolidate(my_llm_summarize, min_similarity=0.85, dry_run=True)
+mem.consolidate(my_llm_summarize, min_similarity=0.85, dry_run=False)
+
+# export the graph (namespace-scoped)
+mem.export_graph(fmt="dot", path="graph.dot")     # Graphviz
+mem.export_graph(fmt="html", path="graph.html")   # self-contained HTML/SVG
+```
+
+With a camouflage codec, `summarize_fn` only ever sees tokenized content — raw
+PII never leaves the process.
+
 ---
 
 ## Configuration
@@ -727,10 +745,10 @@ Here's what's planned for future releases:
 - ~~**Hybrid search**~~ ✅ — `HybridBackend` fuses TF-IDF keyword matching with embedding similarity via reciprocal rank fusion
 - ~~**Async embedding backend**~~ ✅ — non-blocking `aadd`/`asearch`/`aget_context` (offload to a worker thread so a blocking embedding call doesn't stall the event loop); the LangGraph adapter uses them
 - ~~**Streaming persistence**~~ ✅ — append-only journal (`enable_journal`) with automatic crash-recovery replay on load and compaction on save; records encrypted per-line when a key is set
-- **Memory consolidation** — automatically merge near-duplicate zettels and summarise clusters to stay within capacity without losing information
+- ~~**Memory consolidation**~~ ✅ — `consolidate(summarize_fn)` merges near-duplicate clusters (connected components above a similarity threshold) into one summarised memory; dry run by default
 - ~~**Importance decay and reinforcement**~~ ✅ — opt-in read-time importance decay for unused memories and reinforcement for frequently-retrieved ones (`importance_half_life_days`, `reinforcement`)
 - **Multi-modal zettels** — support images, code snippets, and structured data as first-class zettel content alongside text
-- **Graph visualisation** — export the zettel link graph to formats like DOT/Graphviz or interactive HTML for exploring memory structure
+- ~~**Graph visualisation**~~ ✅ — `export_graph(fmt="dot"|"html")` writes the link graph as Graphviz DOT or a self-contained HTML/SVG page (namespace-scoped)
 - **Vector database backends** — ✅ FAISS (`FaissBackend`, exact + HNSW); Qdrant, ChromaDB, and Pinecone still planned for scaling beyond in-memory limits
 - ~~**Claude Code memory commands**~~ ✅ — higher-level tools `memory_reflect` (gather what you know about topic X to summarise) and `memory_prune` (find/delete stale entries, dry run by default), exposed over MCP and SMCP
 
