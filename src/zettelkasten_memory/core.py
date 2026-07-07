@@ -121,11 +121,23 @@ class ZettelMemory:
         max_content_bytes: int = 65536,
         max_metadata_bytes: int = 16384,
         camouflage: "CamouflageCodec | None" = None,
+        importance_half_life_days: float | None = None,
+        reinforcement: float = 0.0,
     ):
         self.max_zettels = max_zettels
         self.connection_threshold = connection_threshold
         self.max_content_bytes = max_content_bytes
         self.max_metadata_bytes = max_metadata_bytes
+        # Importance decay & reinforcement (both opt-in; defaults are neutral so
+        # existing behavior is unchanged):
+        #   - importance_half_life_days: at read time, a memory's importance is
+        #     scaled by 0.5 ** (days_since_access / half_life). Unused memories
+        #     rank lower and become prune candidates; None disables decay.
+        #   - reinforcement: each time a memory is returned by search, its stored
+        #     importance is nudged up by this amount (capped at 1.0), so
+        #     frequently-retrieved memories climb. 0.0 disables it.
+        self.importance_half_life_days = importance_half_life_days
+        self.reinforcement = float(reinforcement)
         self._backend: SearchBackend = backend or TfidfBackend()
         self._zettels: dict[str, Zettel] = {}
         self._camouflage = camouflage
@@ -294,7 +306,8 @@ class ZettelMemory:
 
             recency = 1.0 / (1.0 + (now - zettel.accessed_at) / 86400)  # decay over days
             conn_boost = 1.0 + 0.1 * min(len(zettel.connections), 10)  # cap boost at 2x
-            score = sim * zettel.importance * (0.7 + 0.3 * recency) * conn_boost
+            importance = self._effective_importance(zettel, now)
+            score = sim * importance * (0.7 + 0.3 * recency) * conn_boost
 
             if score >= min_score:
                 results.append(SearchResult(zettel=zettel, score=score))
@@ -304,12 +317,27 @@ class ZettelMemory:
         if not results:
             return self._reveal_results(self._keyword_search(query, limit, namespace))
 
-        # Mark accessed
+        # Mark accessed (and reinforce retrieved memories, if enabled)
         for r in results[:limit]:
             r.zettel.access_count += 1
             r.zettel.accessed_at = now
+            if self.reinforcement:
+                r.zettel.importance = min(1.0, r.zettel.importance + self.reinforcement)
 
         return self._reveal_results(results[:limit])
+
+    def _effective_importance(self, zettel: Zettel, now: float) -> float:
+        """Importance after read-time decay (no-op unless decay is enabled).
+
+        Scales stored importance by ``0.5 ** (days_since_access / half_life)``
+        so memories that haven't been accessed in a while count for less in
+        ranking. Purely a read-time view — the stored importance is unchanged.
+        """
+        half_life = self.importance_half_life_days
+        if not half_life or half_life <= 0:
+            return zettel.importance
+        age_days = (now - zettel.accessed_at) / 86400
+        return zettel.importance * (0.5 ** (age_days / half_life))
 
     def _reveal_results(self, results: list[SearchResult]) -> list[SearchResult]:
         if self._camouflage is None or not self._camouflage.reveal:
@@ -585,6 +613,8 @@ class ZettelMemory:
             "config": {
                 "max_zettels": self.max_zettels,
                 "connection_threshold": self.connection_threshold,
+                "importance_half_life_days": self.importance_half_life_days,
+                "reinforcement": self.reinforcement,
             },
             "backend": self._backend.to_dict(),
         }
@@ -659,6 +689,8 @@ class ZettelMemory:
             connection_threshold=config.get("connection_threshold", 0.25),
             backend=backend,
             camouflage=camouflage,
+            importance_half_life_days=config.get("importance_half_life_days"),
+            reinforcement=config.get("reinforcement", 0.0) or 0.0,
         )
         mem._loaded_encrypted = loaded_encrypted
         if data.get("camouflage") and camouflage is None:

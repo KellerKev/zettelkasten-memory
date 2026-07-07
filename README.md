@@ -148,6 +148,33 @@ mem = ZettelMemory.load("memory.json", embed_fn=embed)  # for adding new memorie
 mem = ZettelMemory.load("memory.json")                   # read-only, search existing
 ```
 
+### Hybrid Backend
+
+Runs **both** TF-IDF and embeddings for every query and fuses the two ranked
+lists with **reciprocal rank fusion (RRF)** — so exact-term hits (keywords) and
+paraphrase hits (semantics) both surface in one ranking. RRF is scale-free, so
+there is no fragile normalisation between the two similarity scales, and it
+replaces the old all-or-nothing keyword fallback.
+
+```python
+from zettelkasten_memory import ZettelMemory, HybridBackend, EmbeddingBackend
+
+# bring your own embed function
+mem = ZettelMemory(backend=HybridBackend(embed_fn=my_embed_fn))
+
+# or compose an existing provider-backed embedding backend, and tune the mix
+backend = HybridBackend(
+    embedding=EmbeddingBackend.from_provider("ollama"),
+    tfidf_weight=1.0,
+    embedding_weight=1.5,   # lean semantic
+)
+mem = ZettelMemory(backend=backend)
+```
+
+Auto-linking still uses the semantic backend (the `connection_threshold` is
+calibrated on cosine similarity, not fused scores). The backend serialises with
+the store, so a reload restores the hybrid config and vectors.
+
 ### Backend comparison
 
 | Backend | How it works | Semantic understanding | Config needed |
@@ -155,6 +182,7 @@ mem = ZettelMemory.load("memory.json")                   # read-only, search exi
 | `TfidfBackend` | scikit-learn TF-IDF + cosine similarity | Keyword matching only | None |
 | `EmbeddingBackend` | Embedding vectors + normalised dot product | Full semantic search | An embedding provider or function |
 | `EmbeddingBackend` + `TurboQuantCompressor` | Same, with compressed storage | Full semantic, <2% recall loss | Provider + `compressor=` flag |
+| `HybridBackend` | TF-IDF + embeddings fused with reciprocal rank fusion | Keyword **and** semantic | An embedding provider or function |
 
 ---
 
@@ -549,6 +577,26 @@ score = similarity * importance * (0.7 + 0.3 * recency) * connection_boost
 - **connection_boost** rewards well-connected zettels (up to 2x for 10+ links)
 - Falls back to keyword overlap when the backend yields no matches
 
+### Importance decay and reinforcement (opt-in)
+
+Both are off by default (neutral scoring). Enable them on the constructor:
+
+```python
+mem = ZettelMemory(
+    importance_half_life_days=30,  # unused memories fade in ranking
+    reinforcement=0.05,            # retrieved memories climb (capped at 1.0)
+)
+```
+
+- **Decay** is applied at read time — a memory's importance is scaled by
+  `0.5 ** (days_since_access / half_life)` when scoring. The stored value is
+  untouched; unused memories simply rank lower (and become `memory_prune`
+  candidates). No background jobs.
+- **Reinforcement** nudges a memory's stored importance up by the configured
+  step each time search returns it, so frequently-retrieved memories rise.
+
+Both settings persist with the store.
+
 ### Eviction
 
 When over capacity, the least-valuable zettels are removed:
@@ -627,11 +675,11 @@ Here's what's planned for future releases:
 - ~~**PII camouflage**~~ ✅ — deterministic AES-SIV tokenization before indexing/embedding
 - ~~**Namespace isolation**~~ ✅ — storage-level multi-tenancy, no cross-tenant links, fair eviction
 - ~~**SMCP server**~~ ✅ — authenticated + encrypted tool channel, identity-bound namespaces
-- **Hybrid search** — combine TF-IDF keyword matching with embedding similarity for best-of-both-worlds retrieval
+- ~~**Hybrid search**~~ ✅ — `HybridBackend` fuses TF-IDF keyword matching with embedding similarity via reciprocal rank fusion
 - **Async embedding backend** — non-blocking API calls for embedding providers, useful in async agent frameworks
 - **Streaming persistence** — incremental writes instead of full JSON dumps, for large memory stores
 - **Memory consolidation** — automatically merge near-duplicate zettels and summarise clusters to stay within capacity without losing information
-- **Importance decay and reinforcement** — automatically decrease importance of unused memories over time, and boost memories that are frequently retrieved
+- ~~**Importance decay and reinforcement**~~ ✅ — opt-in read-time importance decay for unused memories and reinforcement for frequently-retrieved ones (`importance_half_life_days`, `reinforcement`)
 - **Multi-modal zettels** — support images, code snippets, and structured data as first-class zettel content alongside text
 - **Graph visualisation** — export the zettel link graph to formats like DOT/Graphviz or interactive HTML for exploring memory structure
 - **Vector database backends** — pluggable storage backends using FAISS, Qdrant, ChromaDB, or Pinecone for scaling beyond in-memory limits

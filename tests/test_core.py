@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from zettelkasten_memory import ZettelMemory, Zettel, SearchResult
 from zettelkasten_memory.backends import TfidfBackend, EmbeddingBackend
@@ -166,6 +167,49 @@ def test_prune_is_namespace_scoped():
     assert all(c["namespace"] == "a" for c in res["candidates"])
 
 
+def test_importance_decay_default_off():
+    import time
+
+    mem = ZettelMemory()  # no decay configured
+    z = mem.add("note", importance=0.5)
+    mem._zettels[z.id].accessed_at = time.time() - 365 * 86400  # a year stale
+    assert mem._effective_importance(mem._zettels[z.id], time.time()) == 0.5
+
+
+def test_importance_decay_lowers_stale_memories():
+    import time
+
+    mem = ZettelMemory(importance_half_life_days=7)
+    now = time.time()
+    fresh = mem.add("fresh note", importance=0.5)
+    stale = mem.add("stale note", importance=0.5)
+    mem._zettels[stale.id].accessed_at = now - 14 * 86400  # ~2 half-lives -> ~0.25x
+    eff_fresh = mem._effective_importance(mem._zettels[fresh.id], now)
+    eff_stale = mem._effective_importance(mem._zettels[stale.id], now)
+    assert eff_stale < eff_fresh
+    assert abs(eff_stale - 0.5 * 0.25) < 0.02
+
+
+def test_reinforcement_boosts_and_caps():
+    mem = ZettelMemory(reinforcement=0.1)
+    z = mem.add("reinforce me about databases", importance=0.5)
+    mem.search("databases")
+    assert mem._zettels[z.id].importance > 0.5
+    for _ in range(20):
+        mem.search("databases")
+    assert mem._zettels[z.id].importance <= 1.0
+
+
+def test_decay_reinforcement_config_roundtrip(tmp_path):
+    mem = ZettelMemory(importance_half_life_days=30, reinforcement=0.05)
+    mem.add("note")
+    path = tmp_path / "m.json"
+    mem.save(path)
+    loaded = ZettelMemory.load(path)
+    assert loaded.importance_half_life_days == 30
+    assert loaded.reinforcement == 0.05
+
+
 def test_importance_clamping():
     mem = ZettelMemory()
     z1 = mem.add("test", importance=2.0)
@@ -220,6 +264,58 @@ def test_tfidf_backend_roundtrip():
     b2 = TfidfBackend.from_dict(d)
     assert b2.max_features == 1000
     assert b2.ngram_range == (1, 3)
+
+
+# ------------------------------------------------------------------
+# Hybrid backend tests (deterministic fake embedder — no Ollama needed)
+# ------------------------------------------------------------------
+
+_HYBRID_VOCAB = ["fastapi", "rest", "api", "postgres", "database", "docker", "deploy"]
+
+
+def _fake_embed(texts):
+    out = []
+    for t in texts:
+        low = t.lower()
+        v = np.array([1.0 if w in low else 0.0 for w in _HYBRID_VOCAB], dtype=np.float32)
+        if v.sum() == 0:
+            v[0] = 1e-3
+        out.append(v)
+    return np.array(out)
+
+
+def test_hybrid_backend_protocol_and_search():
+    from zettelkasten_memory import HybridBackend
+    from zettelkasten_memory.backends import SearchBackend
+
+    backend = HybridBackend(embed_fn=_fake_embed)
+    assert isinstance(backend, SearchBackend)
+
+    mem = ZettelMemory(backend=backend)
+    mem.add("The project uses FastAPI for the REST API")
+    mem.add("PostgreSQL is the primary database")
+    results = mem.search("database", limit=3)
+    assert results and "PostgreSQL" in results[0].zettel.content
+
+
+def test_hybrid_backend_requires_embedding_source():
+    from zettelkasten_memory import HybridBackend
+
+    with pytest.raises(ValueError):
+        HybridBackend()
+
+
+def test_hybrid_backend_roundtrip(tmp_path):
+    from zettelkasten_memory import HybridBackend
+
+    mem = ZettelMemory(backend=HybridBackend(embed_fn=_fake_embed))
+    mem.add("Deployment uses Docker containers")
+    path = tmp_path / "hybrid.json"
+    mem.save(path)
+
+    loaded = ZettelMemory.load(path, embed_fn=_fake_embed)
+    assert loaded._backend.to_dict()["type"] == "hybrid"
+    assert loaded.search("Docker deploy", limit=2)
 
 
 # ------------------------------------------------------------------

@@ -440,12 +440,130 @@ class EmbeddingBackend:
 
 
 # ------------------------------------------------------------------
+# Hybrid backend
+# ------------------------------------------------------------------
+
+
+class HybridBackend:
+    """Combine TF-IDF keyword search with embedding semantic search.
+
+    Each query runs through both sub-backends and their result lists are merged
+    with **reciprocal rank fusion** (RRF): an id's fused score is
+    ``sum_b weight_b / (rrf_k + rank_b)`` over the backends that ranked it. RRF
+    is scale-free, so it sidesteps the fact that TF-IDF cosine and embedding
+    dot products live on different scales — no per-backend normalisation, and a
+    document that ranks well in *either* modality surfaces. This also removes
+    the old all-or-nothing keyword fallback: exact-term hits (TF-IDF) and
+    paraphrase hits (embeddings) contribute to one ranking.
+
+    Auto-linking (``find_similar``) instead delegates to the semantic backend,
+    because ``connection_threshold`` is calibrated against cosine similarity
+    (0..1), not fused RRF scores.
+
+    Usage::
+
+        backend = HybridBackend(embed_fn=my_embed_fn)
+        backend = HybridBackend(embedding=EmbeddingBackend.from_provider("ollama"))
+        mem = ZettelMemory(backend=backend)
+    """
+
+    def __init__(
+        self,
+        embed_fn: EmbedFn | None = None,
+        *,
+        tfidf: "TfidfBackend | None" = None,
+        embedding: "EmbeddingBackend | None" = None,
+        tfidf_weight: float = 1.0,
+        embedding_weight: float = 1.0,
+        rrf_k: int = 60,
+    ) -> None:
+        if embedding is None and embed_fn is None:
+            raise ValueError(
+                "HybridBackend needs an embedding source: pass embed_fn= or embedding="
+            )
+        self._tfidf = tfidf or TfidfBackend()
+        self._embedding = embedding or EmbeddingBackend(embed_fn=embed_fn)
+        self.tfidf_weight = float(tfidf_weight)
+        self.embedding_weight = float(embedding_weight)
+        self.rrf_k = int(rrf_k)
+
+    # -- protocol -------------------------------------------------
+
+    @property
+    def needs_rebuild(self) -> bool:
+        return self._tfidf.needs_rebuild or self._embedding.needs_rebuild
+
+    @needs_rebuild.setter
+    def needs_rebuild(self, value: bool) -> None:
+        self._tfidf.needs_rebuild = value
+        self._embedding.needs_rebuild = value
+
+    def build_index(self, ids: list[str], texts: list[str]) -> None:
+        self._tfidf.build_index(ids, texts)
+        self._embedding.build_index(ids, texts)
+
+    def _rrf(self, pairs: list[tuple[str, float]], weight: float) -> dict[str, float]:
+        """Reciprocal-rank contribution of one backend's ranked results."""
+        out: dict[str, float] = {}
+        for rank, (zid, _score) in enumerate(pairs):
+            out[zid] = weight / (self.rrf_k + rank)
+        return out
+
+    def query(self, text: str) -> list[tuple[str, float]]:
+        t = self._rrf(self._tfidf.query(text), self.tfidf_weight)
+        e = self._rrf(self._embedding.query(text), self.embedding_weight)
+        fused: dict[str, float] = dict(t)
+        for zid, contrib in e.items():
+            fused[zid] = fused.get(zid, 0.0) + contrib
+        pairs = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+        return pairs
+
+    def find_similar(self, text: str, threshold: float) -> list[tuple[str, float]]:
+        # Linking thresholds are calibrated on cosine similarity; use the
+        # semantic backend, falling back to TF-IDF only if it has no vectors.
+        similar = self._embedding.find_similar(text, threshold)
+        if similar:
+            return similar
+        return self._tfidf.find_similar(text, threshold)
+
+    def extract_tags(self, text: str) -> set[str]:
+        return self._tfidf.extract_tags(text)
+
+    # -- persistence ------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "hybrid",
+            "tfidf": self._tfidf.to_dict(),
+            "embedding": self._embedding.to_dict(),
+            "tfidf_weight": self.tfidf_weight,
+            "embedding_weight": self.embedding_weight,
+            "rrf_k": self.rrf_k,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], embed_fn: EmbedFn | None = None) -> "HybridBackend":
+        tfidf = TfidfBackend.from_dict(data.get("tfidf", {"type": "tfidf"}))
+        embedding = EmbeddingBackend.from_dict(
+            data.get("embedding", {"type": "embedding"}), embed_fn=embed_fn
+        )
+        return cls(
+            tfidf=tfidf,
+            embedding=embedding,
+            tfidf_weight=data.get("tfidf_weight", 1.0),
+            embedding_weight=data.get("embedding_weight", 1.0),
+            rrf_k=data.get("rrf_k", 60),
+        )
+
+
+# ------------------------------------------------------------------
 # Registry — resolve backend type string to class
 # ------------------------------------------------------------------
 
 BACKEND_REGISTRY: dict[str, type] = {
     "tfidf": TfidfBackend,
     "embedding": EmbeddingBackend,
+    "hybrid": HybridBackend,
 }
 
 
@@ -455,6 +573,6 @@ def backend_from_dict(data: dict[str, Any], **kwargs: Any) -> SearchBackend:
     cls = BACKEND_REGISTRY.get(btype)
     if cls is None:
         raise ValueError(f"Unknown backend type: {btype!r}")
-    if btype == "embedding":
+    if btype in ("embedding", "hybrid"):
         return cls.from_dict(data, embed_fn=kwargs.get("embed_fn"))  # type: ignore[arg-type]
     return cls.from_dict(data)
