@@ -355,6 +355,34 @@ def test_faiss_backend_rejects_bad_index():
 
 
 # ------------------------------------------------------------------
+# Async API (non-blocking wrappers)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_add_search_context():
+    mem = ZettelMemory()
+    z = await mem.aadd("PostgreSQL is the primary database", importance=0.8)
+    assert z.id in mem._zettels
+
+    results = await mem.asearch("database", limit=3)
+    assert results and "PostgreSQL" in results[0].zettel.content
+
+    ctx = await mem.aget_context("database")
+    assert isinstance(ctx, str) and ctx
+
+
+@pytest.mark.asyncio
+async def test_async_writes_are_serialized():
+    import asyncio as _asyncio
+
+    mem = ZettelMemory()
+    await _asyncio.gather(*(mem.aadd(f"concurrent note number {i}") for i in range(15)))
+    # every write landed; the per-store lock prevents lost updates on _zettels
+    assert len(mem._zettels) == 15
+
+
+# ------------------------------------------------------------------
 # Embedding backend tests (real Ollama embeddings)
 # ------------------------------------------------------------------
 

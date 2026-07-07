@@ -1802,6 +1802,7 @@ packages:
   - cryptography>=42.0.0 ; extra == 'dev'
   - websockets>=11.0 ; extra == 'dev'
   - pyjwt>=2.8.0 ; extra == 'dev'
+  - faiss-cpu>=1.7.0 ; extra == 'dev'
   requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/00/4b/ccc026168948fec4f7555b9164c724cf4125eac006e176541483d2c959be/pydantic_settings-2.13.1-py3-none-any.whl
   name: pydantic-settings

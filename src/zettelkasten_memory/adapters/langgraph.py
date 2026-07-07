@@ -118,8 +118,11 @@ if _HAS_LANGGRAPH:
             return results
 
         async def abatch(self, ops: Iterable) -> list:
-            """Async version — delegates to sync since ZettelMemory is CPU-bound."""
-            return self.batch(ops)
+            """Async version — runs the sync batch in a worker thread so a
+            blocking embedding call doesn't stall the event loop."""
+            import asyncio
+
+            return await asyncio.to_thread(self.batch, list(ops))
 
         def _handle_get(self, op: GetOp) -> Item | None:
             ns = _ns_key(op.namespace)

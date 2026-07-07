@@ -14,6 +14,7 @@ with a keyword fallback.  Connected zettels are boosted in search results
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -141,6 +142,7 @@ class ZettelMemory:
         self._backend: SearchBackend = backend or TfidfBackend()
         self._zettels: dict[str, Zettel] = {}
         self._camouflage = camouflage
+        self._async_lock: asyncio.Lock | None = None
 
     # ------------------------------------------------------------------
     # Camouflage helpers
@@ -343,6 +345,72 @@ class ZettelMemory:
         if self._camouflage is None or not self._camouflage.reveal:
             return results
         return [SearchResult(zettel=self._reveal(r.zettel), score=r.score) for r in results]
+
+    # ------------------------------------------------------------------
+    # Async API (non-blocking wrappers for async agent frameworks)
+    # ------------------------------------------------------------------
+    #
+    # These run the synchronous methods in a worker thread so an embedding
+    # provider's blocking HTTP call does not stall the event loop. A per-store
+    # lock serialises them, so concurrent coroutines don't race on the store
+    # (ZettelMemory itself is single-writer). The sync methods remain canonical.
+
+    def _alock(self) -> asyncio.Lock:
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        return self._async_lock
+
+    async def aadd(
+        self,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        tags: set[str] | None = None,
+        importance: float = 0.5,
+        namespace: str = "default",
+    ) -> Zettel:
+        """Async ``add`` — offloads to a thread; see :meth:`add`."""
+        async with self._alock():
+            return await asyncio.to_thread(
+                self.add,
+                content,
+                metadata=metadata,
+                tags=tags,
+                importance=importance,
+                namespace=namespace,
+            )
+
+    async def asearch(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        min_score: float = 0.0,
+        namespace: str | None = "default",
+    ) -> list[SearchResult]:
+        """Async ``search`` — offloads to a thread; see :meth:`search`."""
+        async with self._alock():
+            return await asyncio.to_thread(
+                self.search, query, limit=limit, min_score=min_score, namespace=namespace
+            )
+
+    async def aget_context(
+        self,
+        query: str,
+        *,
+        max_tokens: int = 4000,
+        limit: int = 10,
+        namespace: str | None = "default",
+    ) -> str:
+        """Async ``get_context`` — offloads to a thread; see :meth:`get_context`."""
+        async with self._alock():
+            return await asyncio.to_thread(
+                self.get_context,
+                query,
+                max_tokens=max_tokens,
+                limit=limit,
+                namespace=namespace,
+            )
 
     def get(self, zettel_id: str, *, namespace: str | None = "default") -> Zettel | None:
         """Get a zettel by ID.

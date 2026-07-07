@@ -105,6 +105,17 @@ mem.delete(z.id)       # removes zettel and cleans up all links
 print(mem.stats)       # {"total_zettels": ..., "total_connections": ..., ...}
 ```
 
+### Async (for async agent frameworks)
+
+`aadd`, `asearch`, and `aget_context` mirror their sync counterparts but run in
+a worker thread, so a blocking embedding API call doesn't stall your event loop:
+
+```python
+z = await mem.aadd("Uses FastAPI")
+results = await mem.asearch("what framework?")
+ctx = await mem.aget_context("architecture")
+```
+
 ---
 
 ## Backends
@@ -696,7 +707,7 @@ Here's what's planned for future releases:
 - ~~**Namespace isolation**~~ ✅ — storage-level multi-tenancy, no cross-tenant links, fair eviction
 - ~~**SMCP server**~~ ✅ — authenticated + encrypted tool channel, identity-bound namespaces
 - ~~**Hybrid search**~~ ✅ — `HybridBackend` fuses TF-IDF keyword matching with embedding similarity via reciprocal rank fusion
-- **Async embedding backend** — non-blocking API calls for embedding providers, useful in async agent frameworks
+- ~~**Async embedding backend**~~ ✅ — non-blocking `aadd`/`asearch`/`aget_context` (offload to a worker thread so a blocking embedding call doesn't stall the event loop); the LangGraph adapter uses them
 - **Streaming persistence** — incremental writes instead of full JSON dumps, for large memory stores
 - **Memory consolidation** — automatically merge near-duplicate zettels and summarise clusters to stay within capacity without losing information
 - ~~**Importance decay and reinforcement**~~ ✅ — opt-in read-time importance decay for unused memories and reinforcement for frequently-retrieved ones (`importance_half_life_days`, `reinforcement`)
