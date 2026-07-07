@@ -116,6 +116,14 @@ results = await mem.asearch("what framework?")
 ctx = await mem.aget_context("architecture")
 ```
 
+`aconsolidate` awaits an **async** summariser (e.g. an async LLM client), so you
+can consolidate near-duplicates without bridging sync/async:
+
+```python
+async def summarize(texts): ...          # awaits your LLM
+await mem.aconsolidate(summarize, dry_run=False)
+```
+
 ---
 
 ## Backends

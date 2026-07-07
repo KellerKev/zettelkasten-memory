@@ -747,6 +747,57 @@ class ZettelMemory:
             "candidates": candidates,
         }
 
+    def _consolidation_groups(
+        self, namespace: str | None, min_similarity: float, min_cluster: int
+    ) -> list[list[str]]:
+        """Cluster near-duplicate memories in *namespace* into connected
+        components (of at least *min_cluster*), returning lists of zettel ids."""
+        self._rebuild_index_if_needed()
+        scope = [z for z in self._zettels.values() if namespace is None or z.namespace == namespace]
+        ids = [z.id for z in scope]
+        id_set = set(ids)
+        parent = {i: i for i in ids}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for z in scope:
+            for cid, _sim in self._backend.find_similar(z.index_text, min_similarity):
+                if cid in id_set and cid != z.id:
+                    union(z.id, cid)
+
+        components: dict[str, list[str]] = {}
+        for i in ids:
+            components.setdefault(find(i), []).append(i)
+        return [g for g in components.values() if len(g) >= min_cluster]
+
+    def _merge_group(self, group_ids: list[str], summary: str, namespace: str | None):
+        """Replace a cluster with one summarised memory (tags unioned, max
+        importance kept). Returns (new_zettel, removed_count)."""
+        zettels = [self._zettels[i] for i in group_ids if i in self._zettels]
+        tags: set[str] = set().union(*[z.tags for z in zettels]) if zettels else set()
+        importance = max((z.importance for z in zettels), default=0.5)
+        removed = 0
+        for z in zettels:
+            if self.delete(z.id, namespace=None):
+                removed += 1
+        new = self.add(
+            summary,
+            tags=tags,
+            importance=importance,
+            namespace=namespace or "default",
+            metadata={"consolidated_from": len(group_ids)},
+        )
+        return new, removed
+
     def consolidate(
         self,
         summarize_fn,
@@ -766,58 +817,60 @@ class ZettelMemory:
 
         Defaults to a **dry run**: it reports the clusters it *would* merge
         without calling *summarize_fn* or changing anything. Pass
-        ``dry_run=False`` to actually consolidate.
+        ``dry_run=False`` to actually consolidate. See :meth:`aconsolidate` for
+        an ``async`` summariser (e.g. an async LLM client).
 
         With a camouflage codec, *summarize_fn* sees the tokenized content (raw
         PII never leaves the process), and the consolidated summary round-trips
         the same tokens.
         """
-        self._rebuild_index_if_needed()
-        scope = [z for z in self._zettels.values() if namespace is None or z.namespace == namespace]
-        ids = [z.id for z in scope]
-        id_set = set(ids)
-        parent = {i: i for i in ids}
-
-        def find(x: str) -> str:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a: str, b: str) -> None:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        for z in scope:
-            for cid, _sim in self._backend.find_similar(z.content, min_similarity):
-                if cid in id_set and cid != z.id:
-                    union(z.id, cid)
-
-        components: dict[str, list[str]] = {}
-        for i in ids:
-            components.setdefault(find(i), []).append(i)
-        groups = [g for g in components.values() if len(g) >= min_cluster]
-
+        groups = self._consolidation_groups(namespace, min_similarity, min_cluster)
         clusters: list[dict[str, Any]] = []
         consolidated = removed = 0
         for g in groups:
-            zettels = [self._zettels[i] for i in g]
             entry: dict[str, Any] = {"ids": list(g), "size": len(g)}
             if not dry_run:
-                summary = summarize_fn([z.content for z in zettels])
-                tags: set[str] = set().union(*[z.tags for z in zettels]) if zettels else set()
-                importance = max(z.importance for z in zettels)
-                for z in zettels:
-                    if self.delete(z.id, namespace=None):
-                        removed += 1
-                new = self.add(
-                    summary,
-                    tags=tags,
-                    importance=importance,
-                    namespace=namespace or "default",
-                    metadata={"consolidated_from": len(g)},
-                )
+                summary = summarize_fn([self._zettels[i].content for i in g])
+                new, r = self._merge_group(g, summary, namespace)
+                removed += r
+                entry["new_id"] = new.id
+                entry["summary"] = self._reveal(new).content
+                consolidated += 1
+            clusters.append(entry)
+
+        return {
+            "dry_run": dry_run,
+            "namespace": namespace,
+            "clusters": clusters,
+            "consolidated": consolidated,
+            "removed": removed,
+        }
+
+    async def aconsolidate(
+        self,
+        summarize_fn,
+        *,
+        namespace: str | None = "default",
+        min_similarity: float = 0.8,
+        min_cluster: int = 2,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Async :meth:`consolidate` for an ``async`` summariser.
+
+        Identical semantics, but ``summarize_fn`` is awaited —
+        ``async def summarize_fn(list[str]) -> str`` — so an async LLM client can
+        be passed directly (no thread-bridging). Clustering runs synchronously in
+        the calling task; only the per-cluster summariser is awaited.
+        """
+        groups = self._consolidation_groups(namespace, min_similarity, min_cluster)
+        clusters: list[dict[str, Any]] = []
+        consolidated = removed = 0
+        for g in groups:
+            entry: dict[str, Any] = {"ids": list(g), "size": len(g)}
+            if not dry_run:
+                summary = await summarize_fn([self._zettels[i].content for i in g])
+                new, r = self._merge_group(g, summary, namespace)
+                removed += r
                 entry["new_id"] = new.id
                 entry["summary"] = self._reveal(new).content
                 consolidated += 1

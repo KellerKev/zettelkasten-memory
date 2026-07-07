@@ -512,6 +512,23 @@ def test_consolidate_merges_cluster():
     assert any("Consolidated deployment" in z.content for z in mem._zettels.values())
 
 
+@pytest.mark.asyncio
+async def test_aconsolidate_awaits_async_summarizer():
+    mem = ZettelMemory(connection_threshold=0.0)
+    mem.add("the deployment uses docker containers on aws")
+    mem.add("the deployment uses docker containers on aws ecs")
+    coffee = mem.add("unrelated note about coffee")
+
+    async def summarize(texts):
+        # an async summariser (e.g. an LLM client) is awaited, not called sync
+        return f"Async-consolidated from {len(texts)} notes"
+
+    res = await mem.aconsolidate(summarize, min_similarity=0.5, dry_run=False)
+    assert res["consolidated"] == 1 and res["removed"] == 2
+    assert len(mem._zettels) == 2 and coffee.id in mem._zettels
+    assert any("Async-consolidated" in z.content for z in mem._zettels.values())
+
+
 # ------------------------------------------------------------------
 # Multi-modal zettels (content_type + search_text)
 # ------------------------------------------------------------------
