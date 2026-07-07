@@ -281,6 +281,33 @@ async def test_memory_stats(mcp_server):
 
 
 @pytest.mark.asyncio
+async def test_memory_reflect(mcp_server):
+    await call_tool(mcp_server, "memory_store", {"content": "the app uses FastAPI"})
+    await call_tool(mcp_server, "memory_store", {"content": "FastAPI serves the REST API"})
+    # TF-IDF fixture: use terms present in the content
+    r = json.loads(await call_tool(mcp_server, "memory_reflect", {"topic": "FastAPI REST API"}))
+    assert r["found"] >= 1
+    assert r["context"]  # provenance-wrapped context string for the agent
+    assert "id" in r["memories"][0]
+
+
+@pytest.mark.asyncio
+async def test_memory_prune(mcp_server):
+    await call_tool(mcp_server, "memory_store", {"content": "keep me", "importance": 0.9})
+    await call_tool(mcp_server, "memory_store", {"content": "prune me", "importance": 0.1})
+    # dry run reports without deleting
+    dry = json.loads(await call_tool(mcp_server, "memory_prune", {"min_importance": 0.5}))
+    assert dry["dry_run"] is True and dry["removed"] == 0 and dry["matched"] == 1
+    assert json.loads(await call_tool(mcp_server, "memory_stats"))["total_zettels"] == 2
+    # real deletion
+    wet = json.loads(
+        await call_tool(mcp_server, "memory_prune", {"min_importance": 0.5, "dry_run": False})
+    )
+    assert wet["removed"] == 1
+    assert json.loads(await call_tool(mcp_server, "memory_stats"))["total_zettels"] == 1
+
+
+@pytest.mark.asyncio
 async def test_memory_store_with_metadata(mcp_server):
     r = await call_tool(
         mcp_server,

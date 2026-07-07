@@ -134,6 +134,38 @@ def test_eviction():
     assert len(mem._zettels) <= 5
 
 
+def test_prune_dry_run_then_delete():
+    import time
+
+    mem = ZettelMemory()
+    keep = mem.add("actively used important note", importance=0.9)
+    stale = mem.add("old forgotten trivia", importance=0.1)
+    mem._zettels[stale.id].accessed_at = time.time() - 40 * 86400
+
+    # dry run: reports the stale candidate, deletes nothing
+    res = mem.prune(max_age_days=30, dry_run=True)
+    assert res["dry_run"] is True and res["removed"] == 0
+    assert res["matched"] == 1 and res["candidates"][0]["id"] == stale.id
+    assert stale.id in mem._zettels
+
+    # real run: deletes the stale one, keeps the fresh important one
+    res = mem.prune(max_age_days=30, dry_run=False)
+    assert res["removed"] == 1
+    assert stale.id not in mem._zettels and keep.id in mem._zettels
+
+
+def test_prune_is_namespace_scoped():
+    mem = ZettelMemory()
+    a = mem.add("tenant a note", namespace="a", importance=0.1)
+    b = mem.add("tenant b note", namespace="b", importance=0.1)
+    # pruning scope "a" (no filters -> everything in a is a candidate) must not
+    # touch namespace b
+    res = mem.prune(namespace="a", dry_run=False)
+    assert a.id not in mem._zettels
+    assert b.id in mem._zettels
+    assert all(c["namespace"] == "a" for c in res["candidates"])
+
+
 def test_importance_clamping():
     mem = ZettelMemory()
     z1 = mem.add("test", importance=2.0)

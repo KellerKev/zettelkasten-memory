@@ -394,7 +394,7 @@ process listings and shell history). API keys come from `OPENAI_API_KEY`,
 `COHERE_API_KEY`, `VOYAGE_API_KEY`, `SNOWFLAKE_PAT_TOKEN`, `MALGRA_API_KEY` /
 `MALGRA_AGENT_JWT`.
 
-This exposes six tools to Claude:
+This exposes eight tools to Claude:
 
 | Tool | Description |
 |---|---|
@@ -404,13 +404,15 @@ This exposes six tools to Claude:
 | `memory_delete` | Delete a memory and clean up links |
 | `memory_connections` | Traverse the link graph (N hops) |
 | `memory_stats` | Get memory statistics |
+| `memory_reflect` | Gather what memory knows about a topic (context + top memories) to summarize |
+| `memory_prune` | Find (and optionally delete) stale, low-value memories — dry run by default |
 
 ---
 
 ## SMCP Server (secure, multi-tenant)
 
 The stdio MCP server trusts the local process — fine for a personal Claude Code
-setup, wrong for anything networked. The **SMCP server** exposes the same six tools
+setup, wrong for anything networked. The **SMCP server** exposes the same eight tools
 over SMCP v3: a WebSocket channel where every payload is Fernet-encrypted and
 HMAC-signed (keys derived from a shared secret via PBKDF2-600k + HKDF), clients
 authenticate with an API key, and the server issues short-lived HS256 JWTs
@@ -633,7 +635,7 @@ Here's what's planned for future releases:
 - **Multi-modal zettels** — support images, code snippets, and structured data as first-class zettel content alongside text
 - **Graph visualisation** — export the zettel link graph to formats like DOT/Graphviz or interactive HTML for exploring memory structure
 - **Vector database backends** — pluggable storage backends using FAISS, Qdrant, ChromaDB, or Pinecone for scaling beyond in-memory limits
-- **Claude Code memory commands** — higher-level MCP tools like `memory_reflect` (summarise what you know about topic X) and `memory_prune` (clean up stale entries)
+- ~~**Claude Code memory commands**~~ ✅ — higher-level tools `memory_reflect` (gather what you know about topic X to summarise) and `memory_prune` (find/delete stale entries, dry run by default), exposed over MCP and SMCP
 
 ---
 

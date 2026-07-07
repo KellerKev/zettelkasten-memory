@@ -326,6 +326,22 @@ class ZettelSMCPServer:
             )
         if tool_name == "memory_stats":
             return _tools.stats(mem, namespace=namespace)
+        if tool_name == "memory_reflect":
+            return _tools.reflect(
+                mem, str(params["topic"]), int(params.get("limit", 10)), namespace=namespace
+            )
+        if tool_name == "memory_prune":
+            result = _tools.prune(
+                mem,
+                params.get("max_age_days"),
+                params.get("min_importance"),
+                int(params.get("limit", 20)),
+                bool(params.get("dry_run", True)),
+                namespace=namespace,
+            )
+            if result.get("removed"):
+                self._persist()
+            return result
         raise KeyError(tool_name)
 
     def _persist(self) -> None:

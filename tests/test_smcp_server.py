@@ -246,6 +246,8 @@ def test_discovery_requires_token(server, crypto):
         "memory_delete",
         "memory_connections",
         "memory_stats",
+        "memory_reflect",
+        "memory_prune",
     }
     assert caps["memory_store"]["auth_required"] is True
 

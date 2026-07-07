@@ -38,6 +38,8 @@ Exposes these tools to the LLM:
     - memory_delete: Delete a memory
     - memory_connections: Get connected memories (graph traversal)
     - memory_stats: Get memory statistics
+    - memory_reflect: Gather what memory knows about a topic (to summarize)
+    - memory_prune: Find/delete stale, low-value memories (dry run by default)
 
 Supported providers (--provider):
     tfidf               Zero config, no API keys (default)
@@ -183,6 +185,42 @@ def create_mcp_server(
     def memory_stats() -> str:
         """Get memory statistics — total count, connections, index state."""
         return json.dumps(_tools.stats(mem, namespace=bound_ns), indent=2)
+
+    @mcp.tool()
+    def memory_reflect(topic: str, limit: int = 10) -> str:
+        """Gather what memory knows about a topic, for you to summarize.
+
+        Returns the provenance-wrapped context plus the top matching memories
+        (tags, connectivity, score). Read-only — nothing is modified.
+
+        Args:
+            topic: The subject to reflect on (natural language).
+            limit: Max memories to gather (default 10).
+        """
+        return json.dumps(_tools.reflect(mem, topic, limit, namespace=bound_ns), indent=2)
+
+    @mcp.tool()
+    def memory_prune(
+        max_age_days: float | None = None,
+        min_importance: float | None = None,
+        limit: int = 20,
+        dry_run: bool = True,
+    ) -> str:
+        """Find (and optionally delete) stale, low-value memories.
+
+        A dry run by default: it reports candidates without deleting. Set
+        dry_run=False to actually delete them (and clean up their links).
+
+        Args:
+            max_age_days: Only consider memories not accessed in this many days.
+            min_importance: Only consider memories with importance below this.
+            limit: Max candidates to return/delete (default 20).
+            dry_run: When True (default), report only; when False, delete.
+        """
+        result = _tools.prune(mem, max_age_days, min_importance, limit, dry_run, namespace=bound_ns)
+        if result.get("removed"):
+            _persist()
+        return json.dumps(result, indent=2)
 
     return mcp
 

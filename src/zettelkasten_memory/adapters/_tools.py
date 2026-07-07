@@ -1,6 +1,6 @@
 """Shared memory-tool implementations for the MCP and SMCP server adapters.
 
-Both servers expose the same six tools; the bodies live here so the two
+Both servers expose the same eight tools; the bodies live here so the two
 protocol layers stay thin and identical in behavior.  Every function takes an
 explicit keyword-only *namespace* — the server derives it from its own binding
 (process-level for stdio MCP, authenticated identity for SMCP), never from a
@@ -178,6 +178,54 @@ def stats(mem: ZettelMemory, *, namespace: str) -> dict[str, Any]:
     return mem.namespace_stats(namespace)
 
 
+def reflect(mem: ZettelMemory, topic: str, limit: int = 10, *, namespace: str) -> dict[str, Any]:
+    """Gather what memory knows about *topic* for the agent to summarize.
+
+    Returns the provenance-wrapped context plus the top matching memories with
+    their tags and connectivity — the calling agent does the actual summary.
+    """
+    limit = max(1, min(int(limit), MAX_LIMIT))
+    results = mem.search(topic, limit=limit, namespace=namespace)
+    context = mem.get_context(topic, limit=limit, max_tokens=2000, namespace=namespace)
+    return {
+        "topic": topic,
+        "found": len(results),
+        "context": context,
+        "memories": [
+            {
+                "id": r.zettel.id,
+                "content": r.zettel.content,
+                "tags": sorted(r.zettel.tags),
+                "connections": len(r.zettel.connections),
+                "score": round(float(r.score), 4),
+            }
+            for r in results
+        ],
+    }
+
+
+def prune(
+    mem: ZettelMemory,
+    max_age_days: float | None = None,
+    min_importance: float | None = None,
+    limit: int = 20,
+    dry_run: bool = True,
+    *,
+    namespace: str,
+) -> dict[str, Any]:
+    """Find (and optionally delete) stale, low-value memories in the namespace.
+
+    Dry run by default — reports candidates without deleting. Pass
+    ``dry_run=False`` to delete them.
+    """
+    return mem.prune(
+        namespace=namespace,
+        max_age_days=max_age_days,
+        min_importance=min_importance,
+        limit=max(1, min(int(limit), MAX_LIMIT)),
+        dry_run=bool(dry_run),
+    )
+
 
 # SMCP capability descriptions (JSON-schema-flavored, mirrors the MCP tools)
 TOOL_SPECS: dict[str, dict[str, Any]] = {
@@ -215,5 +263,27 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "memory_stats": {
         "description": "Get memory statistics — counts, connections, index state.",
         "parameters": {},
+    },
+    "memory_reflect": {
+        "description": (
+            "Gather what memory knows about a topic (context + top memories) "
+            "for you to summarize. Read-only."
+        ),
+        "parameters": {
+            "topic": {"type": "string", "required": True},
+            "limit": {"type": "integer", "default": 10},
+        },
+    },
+    "memory_prune": {
+        "description": (
+            "Find (and optionally delete) stale, low-value memories. Dry run by "
+            "default; set dry_run=false to delete."
+        ),
+        "parameters": {
+            "max_age_days": {"type": "number"},
+            "min_importance": {"type": "number"},
+            "limit": {"type": "integer", "default": 20},
+            "dry_run": {"type": "boolean", "default": True},
+        },
     },
 }

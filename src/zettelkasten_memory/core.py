@@ -477,6 +477,79 @@ class ZettelMemory:
             "namespace": namespace,
         }
 
+    def prune(
+        self,
+        *,
+        namespace: str | None = "default",
+        max_age_days: float | None = None,
+        min_importance: float | None = None,
+        limit: int = 20,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Identify (and optionally delete) stale, low-value memories.
+
+        Scoped to *namespace* (``"default"`` unless overridden; ``None`` spans
+        all namespaces). A zettel is a candidate when it matches every filter
+        that is supplied:
+
+        - *max_age_days*: not accessed in more than this many days.
+        - *min_importance*: importance strictly below this.
+
+        With no filter supplied, every in-scope zettel is a candidate ranked by
+        an eviction value (``importance * (1 + access_count) * recency``), so the
+        least valuable surface first. Candidates are returned lowest-value first,
+        capped at *limit*.
+
+        Defaults to a **dry run**: it reports candidates without deleting. Pass
+        ``dry_run=False`` to actually delete them (and clean up their links).
+        """
+        now = time.time()
+
+        def value(z: Zettel) -> float:
+            recency = 1.0 / (1.0 + (now - z.accessed_at) / 86400)
+            return z.importance * (1 + z.access_count) * recency
+
+        def is_candidate(z: Zettel) -> bool:
+            if max_age_days is not None and (now - z.accessed_at) / 86400 <= max_age_days:
+                return False
+            if min_importance is not None and z.importance >= min_importance:
+                return False
+            return True
+
+        in_scope = [
+            z for z in self._zettels.values() if namespace is None or z.namespace == namespace
+        ]
+        matched = [z for z in in_scope if is_candidate(z)]
+        matched.sort(key=value)  # least valuable (most prunable) first
+        selected = matched[: max(0, limit)]
+
+        candidates = [
+            {
+                "id": z.id,
+                "content": z.content[:120],
+                "importance": z.importance,
+                "access_count": z.access_count,
+                "age_days": round((now - z.accessed_at) / 86400, 2),
+                "namespace": z.namespace,
+                "value": round(value(z), 4),
+            }
+            for z in selected
+        ]
+
+        removed = 0
+        if not dry_run:
+            for z in selected:
+                if self.delete(z.id, namespace=None):
+                    removed += 1
+
+        return {
+            "dry_run": dry_run,
+            "namespace": namespace,
+            "matched": len(matched),
+            "removed": removed,
+            "candidates": candidates,
+        }
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
