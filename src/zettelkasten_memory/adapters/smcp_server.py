@@ -63,6 +63,14 @@ from zettelkasten_memory.core import ZettelMemory
 logger = logging.getLogger(__name__)
 
 
+def _protocol_major(version: str) -> str:
+    """MAJOR component of a ``"<major>.<minor>"`` protocol version string.
+
+    Version negotiation compares MAJOR only (SMCP_PROTOCOL.md): a future ``3.x``
+    interoperates with ``3.0`` while a different major (``2.x``/``4.x``) is rejected."""
+    return str(version).split(".", 1)[0].strip()
+
+
 def _env(name: str, env: Mapping[str, str], default: str = "") -> str:
     """Read config with prefix precedence: ZETTEL_SMCP_* > SMCP_* > SCP_*."""
     for prefix in ("ZETTEL_SMCP_", "SMCP_", "SCP_"):
@@ -84,6 +92,14 @@ class SMCPServerConfig:
     token_ttl: int = 3600
     max_skew: float = 300.0
     max_message_bytes: int = 1_048_576
+    # A2A federation (receiver side). Off by default; when enabled the server
+    # accepts federated_key_exchange / federated_forward (invoked as tool_invoke
+    # per the SMCP A2A spec) so zettel can be a federation peer like malgra.
+    federation_enabled: bool = False
+    federation_hmac_secret: str = ""       # HMAC proof-fallback secret (empty -> jwt_secret)
+    federation_issuer_pem: str = ""        # RS256 client-token issuer PUBLIC key PEM (verify-only)
+    federation_peer_keys: dict[str, str] = field(default_factory=dict)  # node_id -> proof PEM
+    federation_strict: bool = False        # require ALL proofs to be PS256
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "SMCPServerConfig":
@@ -138,6 +154,27 @@ class SMCPServerConfig:
                 "mode (API key -> JWT over the encrypted channel) is implemented"
             )
 
+        # A2A federation (receiver side), all optional. PEM values are file paths
+        # here and are read into memory so the config carries the key material.
+        fed_enabled = _env("FEDERATION", env).lower() in ("1", "true", "yes")
+        fed_issuer_pem = ""
+        issuer_path = _env("FEDERATION_ISSUER_KEY", env)
+        if issuer_path:
+            with open(issuer_path, "r", encoding="utf-8") as fh:
+                fed_issuer_pem = fh.read()
+        fed_peer_keys: dict[str, str] = {}
+        peer_spec = _env("FEDERATION_PEER_KEYS", env)
+        if peer_spec:
+            for pair in peer_spec.split(","):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if "=" not in pair:
+                    raise SystemExit("ZETTEL_SMCP_FEDERATION_PEER_KEYS entries must be node_id=pem_path pairs")
+                nid, path = pair.split("=", 1)
+                with open(path.strip(), "r", encoding="utf-8") as fh:
+                    fed_peer_keys[nid.strip()] = fh.read()
+
         return cls(
             host=_env("HOST", env, "127.0.0.1"),
             port=int(_env("PORT", env, "8765")),
@@ -149,6 +186,11 @@ class SMCPServerConfig:
             token_ttl=int(_env("TOKEN_TTL", env, "3600")),
             max_skew=float(_env("MAX_SKEW", env, "300")),
             max_message_bytes=int(_env("MAX_MESSAGE_BYTES", env, str(1_048_576))),
+            federation_enabled=fed_enabled,
+            federation_hmac_secret=_env("FEDERATION_HMAC_SECRET", env),
+            federation_issuer_pem=fed_issuer_pem,
+            federation_peer_keys=fed_peer_keys,
+            federation_strict=_env("FEDERATION_STRICT", env).lower() in ("1", "true", "yes"),
         )
 
 
@@ -183,6 +225,22 @@ class ZettelSMCPServer:
         # on restart, and clients simply re-authenticate).
         self._jwt_secret = config.jwt_secret or secrets.token_urlsafe(32)
 
+    def _new_fed_receiver(self):
+        """Build fresh per-connection federation state (ECDH sessions + proof-
+        nonce cache scoped to one connection, matching malgra's ConnState).
+        Receiver-only: verifies forwarded, token-authorized requests and acks."""
+        from zettelkasten_memory.adapters.smcp_federation import FederationReceiver
+
+        receiver = FederationReceiver(
+            self.config.node_id,
+            self.config.federation_hmac_secret or self._jwt_secret,
+            issuer_pem=self.config.federation_issuer_pem or None,
+            strict_asymmetric=self.config.federation_strict,
+        )
+        for nid, pem in self.config.federation_peer_keys.items():
+            receiver.register_peer_public_key(nid, pem)
+        return receiver
+
     # -- message handlers ------------------------------------------------
 
     def _reply(self, msg_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -195,6 +253,15 @@ class ZettelSMCPServer:
 
     def _handle_handshake(self, message: dict[str, Any]) -> dict[str, Any]:
         payload = message.get("payload") or {}
+        # Version negotiation by MAJOR component: reject a genuinely incompatible peer
+        # (2.x/4.x) rather than silently accepting it. A future 3.x still interoperates.
+        client_version = str(payload.get("protocol_version", PROTOCOL_VERSION))
+        if _protocol_major(client_version) != _protocol_major(PROTOCOL_VERSION):
+            return self._error(
+                message["id"],
+                f"unsupported protocol version {client_version!r} "
+                f"(server requires major {_protocol_major(PROTOCOL_VERSION)})",
+            )
         return self._reply(
             "handshake",
             {
@@ -269,7 +336,7 @@ class ZettelSMCPServer:
         }
         return self._reply("capability_discovery", {"capabilities": capabilities})
 
-    def _handle_tool_invoke(self, message: dict[str, Any]) -> dict[str, Any]:
+    def _handle_tool_invoke(self, message: dict[str, Any], fed=None) -> dict[str, Any]:
         payload = message.get("payload") or {}
         claims = self._authorize(payload, "tool_invoke")
         if claims is None:
@@ -277,6 +344,24 @@ class ZettelSMCPServer:
         namespace = claims["ns"]
 
         tool_name = payload.get("tool_name")
+
+        # A2A federation verbs (invoked as tool_invoke per the SMCP A2A spec),
+        # handled before normal tool dispatch when federation is enabled. The
+        # session token still gates access; the forwarding proof + client token
+        # provide the cross-node authorization.
+        if tool_name in ("federated_key_exchange", "federated_forward"):
+            if not self.config.federation_enabled or fed is None:
+                return self._error(message["id"], "federation not enabled on this node")
+            params = dict(payload.get("parameters") or {})
+            try:
+                if tool_name == "federated_key_exchange":
+                    result = fed.key_exchange(params)
+                else:
+                    result = fed.forward(params)
+            except Exception as exc:  # noqa: BLE001 - report federation failures over the wire
+                return self._error(message["id"], f"federation error: {exc}")
+            return self._reply("tool_response", {"tool_name": tool_name, "result": result, "status": "success"})
+
         parameters = dict(payload.get("parameters") or {})
         if "namespace" in parameters:
             logger.warning(
@@ -353,7 +438,7 @@ class ZettelSMCPServer:
     def _persist(self) -> None:
         _tools.persist_memory(self.memory, self.persist_path, encrypt=self.encrypt)
 
-    def _handle_message(self, message: dict[str, Any]) -> dict[str, Any]:
+    def _handle_message(self, message: dict[str, Any], fed=None) -> dict[str, Any]:
         msg_type = message.get("type")
         if msg_type == "handshake":
             return self._handle_handshake(message)
@@ -362,7 +447,7 @@ class ZettelSMCPServer:
         if msg_type == "capability_discovery":
             return self._handle_discovery(message)
         if msg_type == "tool_invoke":
-            return self._handle_tool_invoke(message)
+            return self._handle_tool_invoke(message, fed=fed)
         if msg_type == "heartbeat":
             return self._reply("heartbeat", {"status": "alive", "timestamp": time.time()})
         return self._error(str(message.get("id", "")), "Unknown message type")
@@ -380,6 +465,8 @@ class ZettelSMCPServer:
         # not be re-submitted.  Sized to the freshness window so memory stays
         # bounded.  Only meaningful when freshness checking is on.
         replay_guard = ReplayGuard(ttl=self.config.max_skew) if self.config.max_skew else None
+        # Per-connection federation state (ECDH sessions + proof-nonce cache).
+        fed = self._new_fed_receiver() if self.config.federation_enabled else None
         try:
             async for raw in websocket:
                 try:
@@ -389,7 +476,7 @@ class ZettelSMCPServer:
                         max_skew=self.config.max_skew,
                         replay_guard=replay_guard,
                     )
-                    response = self._handle_message(message)
+                    response = self._handle_message(message, fed=fed)
                 except SMCPProtocolError as exc:
                     logger.warning("rejected message from %s: %s", peer, exc)
                     await websocket.send(_json.dumps(self._error("", str(exc))))
