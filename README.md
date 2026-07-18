@@ -518,8 +518,30 @@ shared channel secret.
 | `ZETTEL_SMCP_HOST` / `_PORT` | bind address | `127.0.0.1:8765` |
 | `ZETTEL_SMCP_TOKEN_TTL` | JWT lifetime (s) | `3600` |
 | `ZETTEL_SMCP_MAX_SKEW` | accepted message age (s), `0` = off | `300` |
+| `ZETTEL_SMCP_FEDERATION` | enable A2A federation receiver (`1`/`true`) | off |
+| `ZETTEL_SMCP_FEDERATION_HMAC_SECRET` | shared-secret proof-verification key | `jwt_secret` |
+| `ZETTEL_SMCP_FEDERATION_ISSUER_KEY` | RS256 client-token issuer PUBLIC key (PEM path) | — |
+| `ZETTEL_SMCP_FEDERATION_PEER_KEYS` | `node_id=pem_path` pairs (per-node PS256 proof keys) | — |
+| `ZETTEL_SMCP_FEDERATION_STRICT` | require ALL forwarding proofs to be PS256 | off |
 
 (`SMCP_*` and `SCP_*` prefixes are accepted as fallbacks.)
+
+The handshake negotiates the protocol version by MAJOR component — a future `3.x`
+interoperates with `3.0`, while an incompatible `2.x`/`4.x` peer is rejected.
+
+### A2A federation (receiver)
+
+When `ZETTEL_SMCP_FEDERATION=1`, the memory node becomes an SMCP **federation
+peer**: it accepts `federated_key_exchange` and `federated_forward` (invoked over
+`tool_invoke` per the SMCP A2A spec) so another node can forward a client-authorized
+request carrying the user's identity. Each connection gets its own forward-secret
+P-256 ECDH session (AES-256-GCM, session-id bound as AAD) and single-use proof-nonce
+cache; forwarding proofs are verified as shared-secret HMAC or per-node RSA-PSS
+(PS256, with algorithm pinning), and RS256 client tokens are verified when an issuer
+key is configured. The crypto is self-contained in
+[`smcp_federation.py`](src/zettelkasten_memory/adapters/smcp_federation.py) and
+verified byte-for-byte against the shared cross-language conformance vectors (the
+same file malgra's Rust implementation checks against).
 
 ### Consuming from an agent
 
