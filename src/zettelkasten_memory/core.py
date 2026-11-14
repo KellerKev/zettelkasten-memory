@@ -1094,7 +1094,11 @@ class ZettelMemory:
         # Only force rebuild if the backend didn't restore vectors from persistence.
         # EmbeddingBackend.from_dict sets _dirty=False when vectors are loaded;
         # TfidfBackend always needs rebuild (it doesn't persist the fitted vectorizer).
-        if backend.needs_rebuild is not False:
+        if type(backend).__name__ == "HybridBackend":
+            # its two halves know their own state: the keyword index is rebuilt,
+            # restored vectors are kept (setting the flag here would mark both)
+            pass
+        elif backend.needs_rebuild is not False:
             mem._backend.needs_rebuild = True
         elif isinstance(backend, TfidfBackend):
             mem._backend.needs_rebuild = True

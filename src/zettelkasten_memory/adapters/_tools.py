@@ -83,6 +83,15 @@ def build_backend(
     return EmbeddingBackend(embed_fn=embed_fn, compressor=compressor)
 
 
+def _embed_fn_of(backend):
+    """The embedding function a configured backend was built with, if any."""
+    for obj in (backend, getattr(backend, "_embedding", None)):
+        fn = getattr(obj, "_embed_fn", None)
+        if fn is not None:
+            return fn
+    return None
+
+
 def build_memory(
     persist_path: str | None,
     backend=None,
@@ -103,10 +112,19 @@ def build_memory(
 
     if persist_path:
         try:
-            mem = ZettelMemory.load(persist_path, camouflage=camouflage)
+            # The embedding function cannot be saved with a store, so a restored
+            # backend gets the configured one back: its saved vectors are kept
+            # (nothing is embedded again) and it can embed queries and new
+            # memories. Without this, every search after a restart failed for
+            # hybrid and FAISS stores.
+            mem = ZettelMemory.load(
+                persist_path, camouflage=camouflage, embed_fn=_embed_fn_of(backend)
+            )
             for attr, value in size_kwargs.items():
                 setattr(mem, attr, value)
-            if backend is not None and isinstance(backend, EmbeddingBackend):
+            if backend is not None and type(mem._backend) is not type(backend):
+                # the store was saved with another kind of index: use the
+                # configured one and index everything again
                 mem._backend = backend
                 mem._backend.needs_rebuild = True
             return mem

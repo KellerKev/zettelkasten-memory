@@ -499,8 +499,14 @@ class HybridBackend:
         self._embedding.needs_rebuild = value
 
     def build_index(self, ids: list[str], texts: list[str]) -> None:
-        self._tfidf.build_index(ids, texts)
-        self._embedding.build_index(ids, texts)
+        # Each half is rebuilt only if it needs it. After a load the keyword
+        # index always does (it is not saved), while restored vectors do not:
+        # rebuilding them would embed the whole store again on every restart.
+        # A change to the memory marks both (the setter above), so both follow.
+        if self._tfidf.needs_rebuild:
+            self._tfidf.build_index(ids, texts)
+        if self._embedding.needs_rebuild:
+            self._embedding.build_index(ids, texts)
 
     def _rrf(self, pairs: list[tuple[str, float]], weight: float) -> dict[str, float]:
         """Reciprocal-rank contribution of one backend's ranked results."""
