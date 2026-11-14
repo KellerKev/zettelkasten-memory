@@ -224,6 +224,11 @@ class ZettelSMCPServer:
         # random per-process secret is used (outstanding tokens are invalidated
         # on restart, and clients simply re-authenticate).
         self._jwt_secret = config.jwt_secret or secrets.token_urlsafe(32)
+        # Reading a memory changes it too (access count, recency, reinforcement). Those
+        # changes are saved in the background rather than on every search, and once more
+        # when the server stops, so "what is used most" survives a restart.
+        self._reads_dirty = False
+        self.read_flush_secs = 30.0
 
     def _new_fed_receiver(self):
         """Build fresh per-connection federation state (ECDH sessions + proof-
@@ -397,6 +402,8 @@ class ZettelSMCPServer:
             )
             self._persist()
             return result
+        if tool_name in ("memory_search", "memory_get", "memory_connections", "memory_reflect"):
+            self._reads_dirty = True
         if tool_name == "memory_search":
             return _tools.search(
                 mem,
@@ -444,6 +451,22 @@ class ZettelSMCPServer:
 
     def _persist(self) -> None:
         _tools.persist_memory(self.memory, self.persist_path, encrypt=self.encrypt)
+        self._reads_dirty = False
+
+    def flush_reads(self) -> bool:
+        """Save access metadata changed by reads since the last save. True if it saved."""
+        if not self._reads_dirty or not self.persist_path:
+            return False
+        self._persist()
+        return True
+
+    async def _flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.read_flush_secs)
+            try:
+                self.flush_reads()
+            except Exception:  # noqa: BLE001 - a failed background save is retried next round
+                logger.exception("saving access metadata failed")
 
     def _handle_message(self, message: dict[str, Any], fed=None) -> dict[str, Any]:
         msg_type = message.get("type")
@@ -514,7 +537,22 @@ class ZettelSMCPServer:
                 self.config.port,
                 len(self.config.api_keys),
             )
-            await asyncio.Future()  # run forever
+            # Run until asked to stop (SIGTERM/SIGINT), then save what reads changed.
+            loop = asyncio.get_running_loop()
+            stop: asyncio.Future = loop.create_future()
+            import signal
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, lambda: stop.done() or stop.set_result(None))
+                except (NotImplementedError, RuntimeError):  # pragma: no cover - e.g. Windows
+                    pass
+            flusher = asyncio.ensure_future(self._flush_loop())
+            try:
+                await stop
+            finally:
+                flusher.cancel()
+                self.flush_reads()
 
 
 def main() -> None:

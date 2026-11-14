@@ -441,6 +441,42 @@ def test_graph_is_scoped_and_read_only(server, crypto):
     assert "deploy" not in json.dumps(other)
 
 
+def test_access_counts_are_saved_without_a_store(crypto, tmp_path):
+    """A search changes access metadata; it is saved by flush_reads (the background
+    save and the save at shutdown), so it survives a restart with nothing stored since."""
+    from zettelkasten_memory.adapters import _tools
+
+    path = str(tmp_path / "store.json")
+    config = SMCPServerConfig.from_env(
+        {"ZETTEL_SMCP_SECRET_KEY": SECRET, "ZETTEL_SMCP_API_KEY": API_KEY_A}
+    )
+    srv = ZettelSMCPServer(_tools.build_memory(None), config, persist_path=path, encrypt=False)
+    token = _auth(srv, crypto, API_KEY_A)
+
+    def call(tool, params):
+        return _roundtrip(
+            srv, crypto, "tool_invoke",
+            {"token": token, "tool_name": tool, "parameters": params},
+        )["payload"]["result"]
+
+    call("memory_store", {"content": "the invoices go out on the first working day"})
+    assert srv.flush_reads() is False          # nothing read since the store saved
+    call("memory_search", {"query": "invoices first working day", "limit": 1})
+    assert srv.flush_reads() is True
+    assert srv.flush_reads() is False
+
+    again = ZettelSMCPServer(
+        _tools.build_memory(path), config, persist_path=path, encrypt=False
+    )
+    token2 = _auth(again, crypto, API_KEY_A)
+    g = _roundtrip(
+        again, crypto, "tool_invoke",
+        {"token": token2, "tool_name": "memory_graph", "parameters": {}},
+    )["payload"]["result"]
+    assert g["nodes"][0]["access_count"] >= 1
+    assert g["most_used"]
+
+
 def test_limit_is_clamped(server, crypto):
     token = _auth(server, crypto, API_KEY_A)
     resp = _roundtrip(
