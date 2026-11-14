@@ -417,6 +417,13 @@ class ZettelSMCPServer:
             )
         if tool_name == "memory_stats":
             return _tools.stats(mem, namespace=namespace)
+        if tool_name == "memory_graph":
+            return _tools.graph(
+                mem,
+                int(params.get("max_nodes", 200)),
+                int(params.get("top", 10)),
+                namespace=namespace,
+            )
         if tool_name == "memory_reflect":
             return _tools.reflect(
                 mem, str(params["topic"]), int(params.get("limit", 10)), namespace=namespace

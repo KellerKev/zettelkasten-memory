@@ -293,6 +293,15 @@ async def test_memory_connections(mcp_server):
 
 
 @pytest.mark.asyncio
+async def test_memory_graph(mcp_server):
+    await call_tool(mcp_server, "memory_store", {"content": "first memory about deploys"})
+    await call_tool(mcp_server, "memory_store", {"content": "second memory about deploys"})
+    g = json.loads(await call_tool(mcp_server, "memory_graph"))
+    assert g["total"] == 2 and len(g["nodes"]) == 2
+    assert g["truncated"] is False
+
+
+@pytest.mark.asyncio
 async def test_memory_stats(mcp_server):
     assert json.loads(await call_tool(mcp_server, "memory_stats"))["total_zettels"] == 0
 

@@ -38,6 +38,7 @@ Exposes these tools to the LLM:
     - memory_delete: Delete a memory
     - memory_connections: Get connected memories (graph traversal)
     - memory_stats: Get memory statistics
+    - memory_graph: The link graph and the most used memories, as data
     - memory_reflect: Gather what memory knows about a topic (to summarize)
     - memory_prune: Find/delete stale, low-value memories (dry run by default)
 
@@ -202,6 +203,19 @@ def create_mcp_server(
     def memory_stats() -> str:
         """Get memory statistics — total count, connections, index state."""
         return json.dumps(_tools.stats(mem, namespace=bound_ns), indent=2)
+
+    @mcp.tool()
+    def memory_graph(max_nodes: int = 200, top: int = 10) -> str:
+        """The link graph of this memory and what is used most, as data for a viewer.
+
+        Returns nodes (label, tags, importance, access count), edges and the
+        most accessed memories. Read-only — looking does not count as an access.
+
+        Args:
+            max_nodes: Most-connected memories to include (max 500).
+            top: How many of the most accessed memories to list.
+        """
+        return json.dumps(_tools.graph(mem, max_nodes, top, namespace=bound_ns), indent=2)
 
     @mcp.tool()
     def memory_reflect(topic: str, limit: int = 10) -> str:

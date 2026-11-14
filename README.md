@@ -473,6 +473,7 @@ This exposes eight tools to Claude:
 | `memory_delete` | Delete a memory and clean up links |
 | `memory_connections` | Traverse the link graph (N hops) |
 | `memory_stats` | Get memory statistics |
+| `memory_graph` | The link graph and the most used memories, as data for a viewer (read-only) |
 | `memory_reflect` | Gather what memory knows about a topic (context + top memories) to summarize |
 | `memory_prune` | Find (and optionally delete) stale, low-value memories — dry run by default |
 

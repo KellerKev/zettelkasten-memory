@@ -204,6 +204,49 @@ def stats(mem: ZettelMemory, *, namespace: str) -> dict[str, Any]:
     return mem.namespace_stats(namespace)
 
 
+MAX_GRAPH_NODES = 500
+LABEL_CHARS = 120
+
+
+def graph(
+    mem: ZettelMemory, max_nodes: int = 200, top: int = 10, *, namespace: str
+) -> dict[str, Any]:
+    """The namespace's link graph and what is used most, as data for a viewer.
+
+    Read-only: unlike a search, looking at the graph does not count as an access
+    and does not reinforce anything. Capped at *max_nodes*, keeping the
+    most-connected memories; ``truncated`` says whether the cap cut anything."""
+    max_nodes = max(1, min(int(max_nodes), MAX_GRAPH_NODES))
+    top = max(0, min(int(top), MAX_LIMIT))
+    nodes, edges = mem._graph_nodes_edges(namespace, max_nodes)
+    total = mem.namespace_stats(namespace)["total_zettels"]
+
+    def row(z) -> dict[str, Any]:
+        text = (z.content or "").strip().replace("\n", " ")
+        return {
+            "id": z.id,
+            "label": text[:LABEL_CHARS] + ("…" if len(text) > LABEL_CHARS else ""),
+            "tags": sorted(z.tags),
+            "content_type": z.content_type,
+            "importance": round(float(z.importance), 4),
+            "access_count": int(z.access_count),
+            "created_at": z.created_at,
+            "accessed_at": z.accessed_at,
+            "connections": len(z.connections),
+        }
+
+    rows = [row(z) for z in nodes]
+    most_used = sorted(rows, key=lambda r: (r["access_count"], r["accessed_at"]), reverse=True)
+    return {
+        "namespace": namespace,
+        "total": total,
+        "truncated": total > len(rows),
+        "nodes": rows,
+        "edges": [list(e) for e in edges],
+        "most_used": [r for r in most_used if r["access_count"] > 0][:top],
+    }
+
+
 def reflect(mem: ZettelMemory, topic: str, limit: int = 10, *, namespace: str) -> dict[str, Any]:
     """Gather what memory knows about *topic* for the agent to summarize.
 
@@ -292,6 +335,16 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "memory_stats": {
         "description": "Get memory statistics — counts, connections, index state.",
         "parameters": {},
+    },
+    "memory_graph": {
+        "description": (
+            "The link graph of this memory and what is used most, as data for a "
+            "viewer: nodes, edges and the most accessed memories. Read-only."
+        ),
+        "parameters": {
+            "max_nodes": {"type": "integer", "default": 200},
+            "top": {"type": "integer", "default": 10},
+        },
     },
     "memory_reflect": {
         "description": (

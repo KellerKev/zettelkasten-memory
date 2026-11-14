@@ -246,6 +246,7 @@ def test_discovery_requires_token(server, crypto):
         "memory_delete",
         "memory_connections",
         "memory_stats",
+        "memory_graph",
         "memory_reflect",
         "memory_prune",
     }
@@ -400,6 +401,44 @@ def test_stats_scoped_to_namespace(server, crypto):
     assert stats["total_zettels"] == 0
     assert "namespaces" not in stats
     assert "tenant-a" not in json.dumps(stats)
+
+
+def test_graph_is_scoped_and_read_only(server, crypto):
+    token_a = _auth(server, crypto, API_KEY_A)
+    token_b = _auth(server, crypto, API_KEY_B)
+
+    def call(token, tool, params):
+        return _roundtrip(
+            server, crypto, "tool_invoke",
+            {"token": token, "tool_name": tool, "parameters": params},
+        )["payload"]["result"]
+
+    for text in ("the deploy runs from the main branch", "the deploy needs the main branch green",
+                 "lunch is at noon"):
+        call(token_a, "memory_store", {"content": text, "tags": ["ops"]})
+    call(token_a, "memory_search", {"query": "deploy main branch", "limit": 1})
+
+    g = call(token_a, "memory_graph", {})
+    assert g["total"] == 3 and g["truncated"] is False
+    assert {n["label"] for n in g["nodes"]} >= {"lunch is at noon"}
+    assert all(set(n) >= {"id", "label", "tags", "importance", "access_count", "connections"}
+               for n in g["nodes"])
+    ids = {n["id"] for n in g["nodes"]}
+    assert all(a in ids and b in ids for a, b in g["edges"])
+    assert g["most_used"] and g["most_used"][0]["access_count"] >= 1
+
+    # looking at the graph is not an access
+    again = call(token_a, "memory_graph", {})
+    assert [n["access_count"] for n in again["nodes"]] == [n["access_count"] for n in g["nodes"]]
+
+    # capped, and the cap is reported
+    small = call(token_a, "memory_graph", {"max_nodes": 1})
+    assert len(small["nodes"]) == 1 and small["truncated"] is True
+
+    # another tenant sees nothing of it
+    other = call(token_b, "memory_graph", {})
+    assert other["total"] == 0 and other["nodes"] == [] and other["edges"] == []
+    assert "deploy" not in json.dumps(other)
 
 
 def test_limit_is_clamped(server, crypto):
