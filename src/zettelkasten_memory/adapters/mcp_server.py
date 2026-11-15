@@ -205,6 +205,21 @@ def create_mcp_server(
         return json.dumps(_tools.stats(mem, namespace=bound_ns), indent=2)
 
     @mcp.tool()
+    def memory_clear(confirm: bool = False) -> str:
+        """Delete every memory of this namespace.
+
+        Does nothing unless confirm is true; without it, reports how many
+        memories would be deleted.
+
+        Args:
+            confirm: Must be true for anything to be deleted.
+        """
+        result = _tools.clear(mem, confirm, namespace=bound_ns)
+        if result.get("deleted"):
+            _persist()
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
     def memory_graph(max_nodes: int = 200, top: int = 10) -> str:
         """The link graph of this memory and what is used most, as data for a viewer.
 

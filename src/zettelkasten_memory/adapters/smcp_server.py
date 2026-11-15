@@ -23,6 +23,10 @@ All secrets come from environment variables (never CLI flags):
     ZETTEL_SMCP_KDF_SALT     per-deployment KDF salt (must match clients)
     ZETTEL_SMCP_API_KEY      single API key bound to ZETTEL_NAMESPACE/default
     ZETTEL_SMCP_API_KEYS     comma-separated key=namespace pairs
+    ZETTEL_SMCP_DELEGATE_KEYS  comma-separated API keys of trusted front ends
+                             (a gateway that authenticates the callers itself):
+                             they may pass `namespace` with each call; every
+                             other key stays bound to its own namespace
     ZETTEL_SMCP_HOST/PORT    bind address (default 127.0.0.1:8765)
     ZETTEL_SMCP_TOKEN_TTL    JWT lifetime seconds (default 3600)
     ZETTEL_SMCP_MAX_SKEW     accepted message-timestamp skew (default 300, 0=off)
@@ -63,6 +67,12 @@ from zettelkasten_memory.core import ZettelMemory
 logger = logging.getLogger(__name__)
 
 
+import re as _re
+
+# A namespace a delegate key may name: short, and nothing that could be a path.
+_NAMESPACE_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
 def _protocol_major(version: str) -> str:
     """MAJOR component of a ``"<major>.<minor>"`` protocol version string.
 
@@ -89,6 +99,10 @@ class SMCPServerConfig:
     jwt_secret: str = ""  # empty -> derived from secret_key
     kdf_salt: str = ""
     api_keys: dict[str, str] = field(default_factory=dict)  # api_key -> namespace
+    # API keys of trusted front ends (a gateway that authenticates the real
+    # callers itself) which may name the namespace of each call. Every other
+    # key stays bound to its own namespace.
+    delegate_keys: frozenset[str] = frozenset()
     token_ttl: int = 3600
     max_skew: float = 300.0
     max_message_bytes: int = 1_048_576
@@ -147,6 +161,9 @@ class SMCPServerConfig:
                 "forge tokens for another tenant"
             )
 
+        delegates = frozenset(k.strip() for k in _env("DELEGATE_KEYS", env).split(",") if k.strip())
+        if delegates - set(api_keys):
+            raise SystemExit("ZETTEL_SMCP_DELEGATE_KEYS names a key that is not an API key")
         mode = _env("MODE", env)
         if mode and mode.lower() != "simple":
             raise SystemExit(
@@ -183,6 +200,7 @@ class SMCPServerConfig:
             jwt_secret=jwt_secret,
             kdf_salt=_env("KDF_SALT", env),
             api_keys=api_keys,
+            delegate_keys=delegates,
             token_ttl=int(_env("TOKEN_TTL", env, "3600")),
             max_skew=float(_env("MAX_SKEW", env, "300")),
             max_message_bytes=int(_env("MAX_MESSAGE_BYTES", env, str(1_048_576))),
@@ -285,9 +303,11 @@ class ZettelSMCPServer:
 
         api_key = str((message.get("payload") or {}).get("api_key", ""))
         namespace = None
+        delegate = False
         for configured, ns in self.config.api_keys.items():
             if _hmac.compare_digest(api_key, configured):
                 namespace = ns
+                delegate = configured in self.config.delegate_keys
                 break
         if namespace is None:
             logger.warning("auth failed for connection")
@@ -298,6 +318,7 @@ class ZettelSMCPServer:
             {
                 "client_id": f"ns:{namespace}",
                 "ns": namespace,
+                "dlg": delegate,
                 "permissions": ["tool_invoke", "discovery"],
                 "iat": now,
                 "exp": now + self.config.token_ttl,
@@ -369,10 +390,16 @@ class ZettelSMCPServer:
 
         parameters = dict(payload.get("parameters") or {})
         if "namespace" in parameters:
-            logger.warning(
-                "client-supplied namespace ignored; connection is bound to %r", namespace
-            )
-            parameters.pop("namespace")
+            named = parameters.pop("namespace")
+            if claims.get("dlg"):
+                # A trusted front end says whose memory this call is for.
+                if not isinstance(named, str) or not _NAMESPACE_RE.fullmatch(named):
+                    return self._error(message["id"], "Tool execution failed: bad namespace")
+                namespace = named
+            else:
+                logger.warning(
+                    "client-supplied namespace ignored; connection is bound to %r", namespace
+                )
 
         if tool_name not in _tools.TOOL_SPECS:
             return self._error(message["id"], f"Tool '{tool_name}' not found")
@@ -424,6 +451,11 @@ class ZettelSMCPServer:
             )
         if tool_name == "memory_stats":
             return _tools.stats(mem, namespace=namespace)
+        if tool_name == "memory_clear":
+            result = _tools.clear(mem, bool(params.get("confirm", False)), namespace=namespace)
+            if result.get("deleted"):
+                self._persist()
+            return result
         if tool_name == "memory_graph":
             return _tools.graph(
                 mem,

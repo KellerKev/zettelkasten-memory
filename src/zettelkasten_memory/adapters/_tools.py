@@ -222,6 +222,15 @@ def stats(mem: ZettelMemory, *, namespace: str) -> dict[str, Any]:
     return mem.namespace_stats(namespace)
 
 
+def clear(mem: ZettelMemory, confirm: bool = False, *, namespace: str) -> dict[str, Any]:
+    """Delete every memory of the namespace. Nothing happens unless *confirm* is true."""
+    ids = [z.id for z in list(mem._zettels.values()) if z.namespace == namespace]
+    if not confirm:
+        return {"deleted": 0, "would_delete": len(ids), "confirm": False}
+    deleted = sum(1 for zid in ids if mem.delete(zid, namespace=namespace))
+    return {"deleted": deleted, "confirm": True}
+
+
 MAX_GRAPH_NODES = 500
 LABEL_CHARS = 120
 
@@ -353,6 +362,13 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "memory_stats": {
         "description": "Get memory statistics — counts, connections, index state.",
         "parameters": {},
+    },
+    "memory_clear": {
+        "description": (
+            "Delete every memory of this namespace. Does nothing unless confirm=true; "
+            "without it, reports how many would be deleted."
+        ),
+        "parameters": {"confirm": {"type": "boolean", "default": False}},
     },
     "memory_graph": {
         "description": (

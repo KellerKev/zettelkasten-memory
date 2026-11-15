@@ -246,6 +246,7 @@ def test_discovery_requires_token(server, crypto):
         "memory_delete",
         "memory_connections",
         "memory_stats",
+        "memory_clear",
         "memory_graph",
         "memory_reflect",
         "memory_prune",
@@ -475,6 +476,50 @@ def test_access_counts_are_saved_without_a_store(crypto, tmp_path):
     )["payload"]["result"]
     assert g["nodes"][0]["access_count"] >= 1
     assert g["most_used"]
+
+
+def test_a_delegate_key_names_the_namespace_and_no_other_key_can(crypto):
+    from zettelkasten_memory.adapters import _tools
+
+    config = SMCPServerConfig.from_env({
+        "ZETTEL_SMCP_SECRET_KEY": SECRET,
+        "ZETTEL_SMCP_API_KEYS": f"{API_KEY_A}=gateway,{API_KEY_B}=tenant-b",
+        "ZETTEL_SMCP_DELEGATE_KEYS": API_KEY_A,
+        "ZETTEL_SMCP_JWT_SECRET": "an-independent-jwt-secret-of-enough-length",
+    })
+    srv = ZettelSMCPServer(_tools.build_memory(None), config)
+    gateway, plain = _auth(srv, crypto, API_KEY_A), _auth(srv, crypto, API_KEY_B)
+
+    def call(token, tool, params):
+        return _roundtrip(
+            srv, crypto, "tool_invoke",
+            {"token": token, "tool_name": tool, "parameters": params},
+        )["payload"]
+
+    call(gateway, "memory_store", {"content": "anna keeps the deploy notes", "namespace": "u-anna"})
+    call(gateway, "memory_store", {"content": "ben keeps the invoice notes", "namespace": "u-ben"})
+    anna = call(gateway, "memory_graph", {"namespace": "u-anna"})["result"]
+    ben = call(gateway, "memory_graph", {"namespace": "u-ben"})["result"]
+    assert [n["label"] for n in anna["nodes"]] == ["anna keeps the deploy notes"]
+    assert [n["label"] for n in ben["nodes"]] == ["ben keeps the invoice notes"]
+    # clearing takes a confirmation and only ever touches the one namespace
+    assert call(gateway, "memory_clear", {"namespace": "u-anna"})["result"] == {
+        "deleted": 0, "would_delete": 1, "confirm": False}
+    assert call(gateway, "memory_clear", {"namespace": "u-anna", "confirm": True})["result"]["deleted"] == 1
+    assert call(gateway, "memory_graph", {"namespace": "u-anna"})["result"]["total"] == 0
+    assert call(gateway, "memory_graph", {"namespace": "u-ben"})["result"]["total"] == 1
+    # without a namespace the delegate works in its own
+    assert call(gateway, "memory_stats", {})["result"]["total_zettels"] == 0
+    # a path or an empty name is refused, not guessed
+    for bad in ("../u-ben", "", "a" * 65, 7):
+        assert "bad namespace" in call(gateway, "memory_stats", {"namespace": bad})["error"]
+    # an ordinary key naming somebody else's namespace still gets only its own
+    mine = call(plain, "memory_graph", {"namespace": "u-anna"})["result"]
+    assert mine["total"] == 0 and mine["namespace"] == "tenant-b"
+    # a delegate key must be one of the API keys
+    with pytest.raises(SystemExit):
+        SMCPServerConfig.from_env({"ZETTEL_SMCP_SECRET_KEY": SECRET, "ZETTEL_SMCP_API_KEY": API_KEY_A,
+                                   "ZETTEL_SMCP_DELEGATE_KEYS": "some-other-key"})
 
 
 def test_limit_is_clamped(server, crypto):
