@@ -32,7 +32,13 @@ All secrets come from environment variables (never CLI flags):
     ZETTEL_SMCP_PROTECTED_NAMESPACES  comma-separated namespaces nobody but an
                              admin key may delete from (memory_delete,
                              memory_clear, memory_prune without dry_run):
-                             what a whole team shares
+                             what a whole team shares. Nothing that looks like
+                             personal data (email, phone, card number) is
+                             stored there.
+    ZETTEL_SMCP_NAMESPACE_CAP  most memories one (unprotected) namespace keeps;
+                             beyond it its own least valuable go (0 = no cap)
+    ZETTEL_SMCP_PROTECTED_CAP  most memories a protected namespace takes; when
+                             full a store is refused, nothing is dropped (0 = no cap)
     ZETTEL_SMCP_HOST/PORT    bind address (default 127.0.0.1:8765)
     ZETTEL_SMCP_TOKEN_TTL    JWT lifetime seconds (default 3600)
     ZETTEL_SMCP_MAX_SKEW     accepted message-timestamp skew (default 300, 0=off)
@@ -52,6 +58,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hmac as _hmac
+import json
 import logging
 import os
 import secrets
@@ -68,6 +75,7 @@ from zettelkasten_memory.adapters.smcp_protocol import (
     make_message,
     parse_message,
 )
+from zettelkasten_memory.camouflage import detect as detect_pii
 from zettelkasten_memory.core import ZettelMemory
 
 logger = logging.getLogger(__name__)
@@ -122,6 +130,11 @@ class SMCPServerConfig:
     # Namespaces only an admin key may delete from: everybody stores and reads,
     # nobody's agent can empty what the whole team relies on.
     protected_namespaces: frozenset[str] = frozenset()
+    # Caps per namespace (0 = none). An ordinary namespace (a person's memory) forgets
+    # its own least valuable memories beyond its cap; a protected one (a team's,
+    # curated) refuses new ones instead, so nothing anybody relies on vanishes.
+    namespace_cap: int = 0
+    protected_cap: int = 0
     token_ttl: int = 3600
     max_skew: float = 300.0
     max_message_bytes: int = 1_048_576
@@ -227,6 +240,8 @@ class SMCPServerConfig:
             delegate_keys=delegates,
             admin_keys=admins,
             protected_namespaces=protected,
+            namespace_cap=int(_env("NAMESPACE_CAP", env, "0") or 0),
+            protected_cap=int(_env("PROTECTED_CAP", env, "0") or 0),
             token_ttl=int(_env("TOKEN_TTL", env, "3600")),
             max_skew=float(_env("MAX_SKEW", env, "300")),
             max_message_bytes=int(_env("MAX_MESSAGE_BYTES", env, str(1_048_576))),
@@ -260,6 +275,10 @@ class ZettelSMCPServer:
 
         self.memory = memory
         self.config = config
+        if config.namespace_cap or config.protected_cap:
+            # the caps per namespace decide; the store-wide cap would otherwise drop
+            # memories across namespaces once their sum reached it
+            memory.max_zettels = max(memory.max_zettels, 10_000_000)
         self.persist_path = persist_path
         self.encrypt = encrypt
         self.crypto = SMCPCrypto(config.secret_key, config.kdf_salt)
@@ -459,6 +478,13 @@ class ZettelSMCPServer:
             {"tool_name": tool_name, "result": result, "status": "success"},
         )
 
+    def _cap_of(self, namespace: str) -> dict[str, Any]:
+        """How many memories this namespace may hold and what happens at the cap, for a
+        viewer: {cap: 0 when there is none, when_full: "refuse" | "forget"}."""
+        if namespace in self.config.protected_namespaces:
+            return {"cap": self.config.protected_cap, "when_full": "refuse"}
+        return {"cap": self.config.namespace_cap, "when_full": "forget"}
+
     def _dispatch(
         self, tool_name: str, params: dict[str, Any], namespace: str, author: str | None = None
     ) -> Any:
@@ -470,6 +496,27 @@ class ZettelSMCPServer:
             metadata.pop("author", None)
             if author:
                 metadata["author"] = author
+            protected = namespace in self.config.protected_namespaces
+            if protected:
+                # what everybody reads takes no personal data; a person's own memory may
+                text = " ".join(
+                    [str(params.get("content") or ""), str(params.get("search_text") or ""),
+                     " ".join(str(t) for t in (params.get("tags") or [])),
+                     json.dumps(metadata, default=str)]
+                )
+                found = detect_pii(text)
+                if found:
+                    raise ValueError(
+                        "this memory is shared by the whole team and takes no personal data "
+                        f"({', '.join(k.replace('_', ' ') for k in found)} found); leave it out, "
+                        "or store it in your own memory"
+                    )
+                cap = self.config.protected_cap
+                if cap and mem.namespace_stats(namespace)["total_zettels"] >= cap:
+                    raise ValueError(
+                        f"the team's memory is full ({cap:,} memories); nothing was stored. "
+                        "Tell the user: the account's admins can delete what is out of date"
+                    )
             result = _tools.store(
                 mem,
                 str(params["content"]),
@@ -480,6 +527,10 @@ class ZettelSMCPServer:
                 params.get("search_text"),
                 namespace=namespace,
             )
+            if not protected and self.config.namespace_cap:
+                gone = mem.evict_namespace(namespace, self.config.namespace_cap)
+                if gone:
+                    result["forgotten"] = gone
             self._persist()
             return result
         if tool_name in ("memory_search", "memory_get", "memory_connections", "memory_reflect"):
@@ -503,19 +554,19 @@ class ZettelSMCPServer:
                 mem, str(params["memory_id"]), int(params.get("depth", 1)), namespace=namespace
             )
         if tool_name == "memory_stats":
-            return _tools.stats(mem, namespace=namespace)
+            return {**_tools.stats(mem, namespace=namespace), **self._cap_of(namespace)}
         if tool_name == "memory_clear":
             result = _tools.clear(mem, bool(params.get("confirm", False)), namespace=namespace)
             if result.get("deleted"):
                 self._persist()
             return result
         if tool_name == "memory_graph":
-            return _tools.graph(
+            return {**_tools.graph(
                 mem,
                 int(params.get("max_nodes", 200)),
                 int(params.get("top", 10)),
                 namespace=namespace,
-            )
+            ), **self._cap_of(namespace)}
         if tool_name == "memory_reflect":
             return _tools.reflect(
                 mem, str(params["topic"]), int(params.get("limit", 10)), namespace=namespace

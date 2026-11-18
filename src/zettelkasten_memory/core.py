@@ -1189,6 +1189,29 @@ class ZettelMemory:
             self.delete(zid, namespace=None)  # evict regardless of namespace
         self._backend.needs_rebuild = True
 
+    def evict_namespace(self, namespace: str, keep: int) -> int:
+        """Keep at most *keep* zettels in *namespace*, removing its least valuable
+        ones (the same measure as `_evict`: importance, use and recency). Nothing
+        outside the namespace is touched. Returns how many were removed."""
+        now = time.time()
+
+        def value(z: Zettel) -> float:
+            recency = 1.0 / (1.0 + (now - z.accessed_at) / 86400)
+            return z.importance * (1 + z.access_count) * recency
+
+        mine = sorted(
+            ((value(z), zid) for zid, z in self._zettels.items() if z.namespace == namespace),
+            reverse=True,
+        )
+        removed = 0
+        while len(mine) > max(0, int(keep)):
+            _, zid = mine.pop()
+            if self.delete(zid, namespace=namespace):
+                removed += 1
+        if removed:
+            self._backend.needs_rebuild = True
+        return removed
+
 
 # ------------------------------------------------------------------
 # Graph export helpers (module-level; no ZettelMemory state needed)

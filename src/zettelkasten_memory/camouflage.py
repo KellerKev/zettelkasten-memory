@@ -57,6 +57,34 @@ class CamouflageError(Exception):
     """Tokenization or detokenization failed."""
 
 
+def detect(text: str, categories: Iterable[str] = ("email", "phone", "credit_card")) -> list[str]:
+    """The kinds of personal data found in *text* (sorted, each once), with the
+    same detectors and checks `CamouflageCodec.tokenize` uses (a card number must
+    pass Luhn, a phone number has 7 to 15 digits and is not a date). Needs no key:
+    for refusing personal data rather than hiding it."""
+    if not text:
+        return []
+    found: set[str] = set()
+    cats = set(categories)
+    if "email" in cats and _EMAIL_RE.search(text):
+        found.add("email")
+    if "credit_card" in cats:
+        for m in _CARD_RE.finditer(text):
+            digits = re.sub(r"[ -]", "", m.group(0))
+            if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+                found.add("credit_card")
+                break
+    if "phone" in cats:
+        for m in _PHONE_RE.finditer(text):
+            value = m.group(0)
+            if _DATE_RE.match(value.strip()):
+                continue
+            if 7 <= len(re.sub(r"\D", "", value)) <= 15:
+                found.add("phone")
+                break
+    return sorted(found)
+
+
 def _luhn_ok(digits: str) -> bool:
     total = 0
     for i, ch in enumerate(reversed(digits)):

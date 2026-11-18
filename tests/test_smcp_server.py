@@ -577,6 +577,57 @@ def test_a_protected_namespace_is_deleted_from_by_an_admin_key_only(crypto):
                                    "ZETTEL_SMCP_ADMIN_KEYS": "some-other-key"})
 
 
+def test_caps_per_namespace_and_no_personal_data_in_a_protected_one(crypto):
+    """A person's memory forgets its own least valuable memories beyond its cap and
+    nobody else's; the team's refuses when full and takes no personal data."""
+    from zettelkasten_memory.adapters import _tools
+    from zettelkasten_memory.camouflage import detect
+
+    config = SMCPServerConfig.from_env({
+        "ZETTEL_SMCP_SECRET_KEY": SECRET,
+        "ZETTEL_SMCP_API_KEY": API_KEY_A,
+        "ZETTEL_SMCP_DELEGATE_KEYS": API_KEY_A,
+        "ZETTEL_SMCP_PROTECTED_NAMESPACES": "team",
+        "ZETTEL_SMCP_NAMESPACE_CAP": "3",
+        "ZETTEL_SMCP_PROTECTED_CAP": "2",
+    })
+    mem = _tools.build_memory(None)
+    srv = ZettelSMCPServer(mem, config)
+    assert mem.max_zettels >= 10_000_000, "the caps per namespace decide, not the store-wide one"
+    gw = _auth(srv, crypto, API_KEY_A)
+
+    def call(tool, params):
+        return _roundtrip(srv, crypto, "tool_invoke",
+                          {"token": gw, "tool_name": tool, "parameters": params})["payload"]
+
+    # Ben's memory is untouched by Anna's filling hers
+    call("memory_store", {"content": "ben's only note", "namespace": "u-ben", "importance": 0.1})
+    for i in range(5):
+        out = call("memory_store", {"content": f"anna note {i} about topic {i}", "namespace": "u-anna",
+                                    "importance": 0.9 if i == 0 else 0.2})["result"]
+    assert out.get("forgotten") == 1
+    anna = call("memory_graph", {"namespace": "u-anna"})["result"]
+    assert anna["total"] == 3 and (anna["cap"], anna["when_full"]) == (3, "forget")
+    assert "anna note 0 about topic 0" in [n["label"] for n in anna["nodes"]], "the valuable one stays"
+    assert call("memory_stats", {"namespace": "u-ben"})["result"]["total_zettels"] == 1
+    # the team's: personal data is refused, in the content, tags or metadata
+    for params in ({"content": "write to anna@example.com"}, {"content": "call +31 6 1234 5678"},
+                   {"content": "the card", "tags": ["4111 1111 1111 1111"]},
+                   {"content": "x", "metadata": {"contact": "ben@example.org"}}):
+        err = call("memory_store", {**params, "namespace": "team"})["error"]
+        assert "takes no personal data" in err
+    # ...while a person's own memory may hold it, and dates and versions are not phone numbers
+    assert "error" not in call("memory_store", {"content": "my mail is anna@example.com", "namespace": "u-anna"})
+    assert detect("released 2026-11-18, version 1.16.0 on 192.168.1.100") == []
+    # full: refused, nothing dropped
+    call("memory_store", {"content": "deploys run from main", "namespace": "team"})
+    call("memory_store", {"content": "staging resets on monday", "namespace": "team"})
+    err = call("memory_store", {"content": "one more fact", "namespace": "team"})["error"]
+    assert "full" in err
+    team = call("memory_graph", {"namespace": "team"})["result"]
+    assert team["total"] == 2 and (team["cap"], team["when_full"]) == (2, "refuse")
+
+
 def test_limit_is_clamped(server, crypto):
     token = _auth(server, crypto, API_KEY_A)
     resp = _roundtrip(
