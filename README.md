@@ -516,6 +516,9 @@ shared channel secret.
 | `ZETTEL_SMCP_SECRET_KEY` | shared secret for the encrypted channel | required |
 | `ZETTEL_SMCP_API_KEY` / `_API_KEYS` | single key, or `key=ns` pairs | required |
 | `ZETTEL_SMCP_JWT_SECRET` | JWT signing secret, independent of the channel key | required for multi-namespace; else random per-process |
+| `ZETTEL_SMCP_DELEGATE_KEYS` | keys of trusted front ends (a gateway that authenticates its callers) that may name the `namespace` and the `author` of each call | none |
+| `ZETTEL_SMCP_ADMIN_KEYS` | keys that may also delete in a protected namespace (each is a delegate) | none |
+| `ZETTEL_SMCP_PROTECTED_NAMESPACES` | namespaces only an admin key may delete from (`memory_delete`, `memory_clear`, `memory_prune` without `dry_run`): what a whole team shares | none |
 | `ZETTEL_SMCP_KDF_SALT` | per-deployment KDF salt (match clients) | `malgra-tunnel-v3` |
 | `ZETTEL_SMCP_HOST` / `_PORT` | bind address | `127.0.0.1:8765` |
 | `ZETTEL_SMCP_TOKEN_TTL` | JWT lifetime (s) | `3600` |

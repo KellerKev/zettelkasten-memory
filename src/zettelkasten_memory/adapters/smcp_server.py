@@ -27,6 +27,12 @@ All secrets come from environment variables (never CLI flags):
                              (a gateway that authenticates the callers itself):
                              they may pass `namespace` with each call; every
                              other key stays bound to its own namespace
+    ZETTEL_SMCP_ADMIN_KEYS   comma-separated API keys that may also delete in a
+                             protected namespace (an admin key is a delegate)
+    ZETTEL_SMCP_PROTECTED_NAMESPACES  comma-separated namespaces nobody but an
+                             admin key may delete from (memory_delete,
+                             memory_clear, memory_prune without dry_run):
+                             what a whole team shares
     ZETTEL_SMCP_HOST/PORT    bind address (default 127.0.0.1:8765)
     ZETTEL_SMCP_TOKEN_TTL    JWT lifetime seconds (default 3600)
     ZETTEL_SMCP_MAX_SKEW     accepted message-timestamp skew (default 300, 0=off)
@@ -73,6 +79,14 @@ import re as _re
 _NAMESPACE_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
+def _deletes(tool_name: str, parameters: dict[str, Any]) -> bool:
+    """Whether this call removes memories (refused in a protected namespace
+    unless an admin key makes it)."""
+    if tool_name in ("memory_delete", "memory_clear"):
+        return True
+    return tool_name == "memory_prune" and not bool(parameters.get("dry_run", True))
+
+
 def _protocol_major(version: str) -> str:
     """MAJOR component of a ``"<major>.<minor>"`` protocol version string.
 
@@ -103,6 +117,11 @@ class SMCPServerConfig:
     # callers itself) which may name the namespace of each call. Every other
     # key stays bound to its own namespace.
     delegate_keys: frozenset[str] = frozenset()
+    # API keys that may also delete in a protected namespace (each is a delegate).
+    admin_keys: frozenset[str] = frozenset()
+    # Namespaces only an admin key may delete from: everybody stores and reads,
+    # nobody's agent can empty what the whole team relies on.
+    protected_namespaces: frozenset[str] = frozenset()
     token_ttl: int = 3600
     max_skew: float = 300.0
     max_message_bytes: int = 1_048_576
@@ -164,6 +183,11 @@ class SMCPServerConfig:
         delegates = frozenset(k.strip() for k in _env("DELEGATE_KEYS", env).split(",") if k.strip())
         if delegates - set(api_keys):
             raise SystemExit("ZETTEL_SMCP_DELEGATE_KEYS names a key that is not an API key")
+        admins = frozenset(k.strip() for k in _env("ADMIN_KEYS", env).split(",") if k.strip())
+        if admins - set(api_keys):
+            raise SystemExit("ZETTEL_SMCP_ADMIN_KEYS names a key that is not an API key")
+        delegates = delegates | admins
+        protected = frozenset(n.strip() for n in _env("PROTECTED_NAMESPACES", env).split(",") if n.strip())
         mode = _env("MODE", env)
         if mode and mode.lower() != "simple":
             raise SystemExit(
@@ -201,6 +225,8 @@ class SMCPServerConfig:
             kdf_salt=_env("KDF_SALT", env),
             api_keys=api_keys,
             delegate_keys=delegates,
+            admin_keys=admins,
+            protected_namespaces=protected,
             token_ttl=int(_env("TOKEN_TTL", env, "3600")),
             max_skew=float(_env("MAX_SKEW", env, "300")),
             max_message_bytes=int(_env("MAX_MESSAGE_BYTES", env, str(1_048_576))),
@@ -303,11 +329,12 @@ class ZettelSMCPServer:
 
         api_key = str((message.get("payload") or {}).get("api_key", ""))
         namespace = None
-        delegate = False
+        delegate = admin = False
         for configured, ns in self.config.api_keys.items():
             if _hmac.compare_digest(api_key, configured):
                 namespace = ns
-                delegate = configured in self.config.delegate_keys
+                admin = configured in self.config.admin_keys
+                delegate = admin or configured in self.config.delegate_keys
                 break
         if namespace is None:
             logger.warning("auth failed for connection")
@@ -319,6 +346,7 @@ class ZettelSMCPServer:
                 "client_id": f"ns:{namespace}",
                 "ns": namespace,
                 "dlg": delegate,
+                "adm": admin,
                 "permissions": ["tool_invoke", "discovery"],
                 "iat": now,
                 "exp": now + self.config.token_ttl,
@@ -401,11 +429,28 @@ class ZettelSMCPServer:
                     "client-supplied namespace ignored; connection is bound to %r", namespace
                 )
 
+        # Who wrote a memory: only a trusted front end, which knows whose call this
+        # is, may say so. From anybody else it is dropped, like a namespace.
+        author = parameters.pop("author", None)
+        if not claims.get("dlg") or not (isinstance(author, str) and _NAMESPACE_RE.fullmatch(author)):
+            author = None
+
         if tool_name not in _tools.TOOL_SPECS:
             return self._error(message["id"], f"Tool '{tool_name}' not found")
 
+        if (
+            namespace in self.config.protected_namespaces
+            and not claims.get("adm")
+            and _deletes(tool_name, parameters)
+        ):
+            return self._error(
+                message["id"],
+                "Tool execution failed: this memory is shared by the whole team; only the "
+                "account's admins can delete from it",
+            )
+
         try:
-            result = self._dispatch(tool_name, parameters, namespace)
+            result = self._dispatch(tool_name, parameters, namespace, author)
         except (ValueError, KeyError, TypeError) as exc:
             return self._error(message["id"], f"Tool execution failed: {exc}")
 
@@ -414,15 +459,23 @@ class ZettelSMCPServer:
             {"tool_name": tool_name, "result": result, "status": "success"},
         )
 
-    def _dispatch(self, tool_name: str, params: dict[str, Any], namespace: str) -> Any:
+    def _dispatch(
+        self, tool_name: str, params: dict[str, Any], namespace: str, author: str | None = None
+    ) -> Any:
         mem = self.memory
         if tool_name == "memory_store":
+            # `author` in the metadata is never the caller's to write: only the
+            # front end's word for it is kept.
+            metadata = dict(params.get("metadata") or {})
+            metadata.pop("author", None)
+            if author:
+                metadata["author"] = author
             result = _tools.store(
                 mem,
                 str(params["content"]),
                 params.get("tags"),
                 float(params.get("importance", 0.5)),
-                params.get("metadata"),
+                metadata,
                 str(params.get("content_type", "text")),
                 params.get("search_text"),
                 namespace=namespace,

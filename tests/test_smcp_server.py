@@ -522,6 +522,61 @@ def test_a_delegate_key_names_the_namespace_and_no_other_key_can(crypto):
                                    "ZETTEL_SMCP_DELEGATE_KEYS": "some-other-key"})
 
 
+def test_a_protected_namespace_is_deleted_from_by_an_admin_key_only(crypto):
+    """What a team shares: everybody's agent (through the gateway, a delegate) stores and
+    reads, nobody's deletes; the admin key (the platform's page) may. Who stored a memory is
+    the front end's word only."""
+    from zettelkasten_memory.adapters import _tools
+
+    API_KEY_ADMIN = "api-key-admin"
+    config = SMCPServerConfig.from_env({
+        "ZETTEL_SMCP_SECRET_KEY": SECRET,
+        "ZETTEL_SMCP_API_KEYS": f"{API_KEY_A}=shared,{API_KEY_ADMIN}=shared,{API_KEY_B}=tenant-b",
+        "ZETTEL_SMCP_DELEGATE_KEYS": API_KEY_A,
+        "ZETTEL_SMCP_ADMIN_KEYS": API_KEY_ADMIN,
+        "ZETTEL_SMCP_PROTECTED_NAMESPACES": "team",
+        "ZETTEL_SMCP_JWT_SECRET": "an-independent-jwt-secret-of-enough-length",
+    })
+    srv = ZettelSMCPServer(_tools.build_memory(None), config)
+    gateway, admin, plain = (_auth(srv, crypto, k) for k in (API_KEY_A, API_KEY_ADMIN, API_KEY_B))
+
+    def call(token, tool, params):
+        return _roundtrip(
+            srv, crypto, "tool_invoke",
+            {"token": token, "tool_name": tool, "parameters": params},
+        )["payload"]
+
+    mid = call(gateway, "memory_store", {"content": "the deploy runs from main", "namespace": "team",
+                                         "author": "u-anna", "metadata": {"author": "u-forged"}})["result"]["id"]
+    call(gateway, "memory_store", {"content": "nobody said who", "namespace": "team"})
+    nodes = {n["label"]: n for n in call(gateway, "memory_graph", {"namespace": "team"})["result"]["nodes"]}
+    assert nodes["the deploy runs from main"]["author"] == "u-anna"
+    assert nodes["nobody said who"]["author"] == ""
+    # an ordinary key cannot say who wrote something, not even through the metadata
+    call(plain, "memory_store", {"content": "mine", "author": "u-anna", "metadata": {"author": "u-anna"}})
+    assert call(plain, "memory_graph", {})["result"]["nodes"][0]["author"] == ""
+    # the gateway's agents cannot delete from the team's memory, in any of the three ways
+    for tool, params in (("memory_delete", {"memory_id": mid}), ("memory_clear", {"confirm": True}),
+                         ("memory_prune", {"dry_run": False, "min_importance": 1.0})):
+        err = call(gateway, tool, {**params, "namespace": "team"})["error"]
+        assert "only the account's admins" in err
+    # a dry-run prune only looks, so it is allowed
+    assert "error" not in call(gateway, "memory_prune", {"namespace": "team", "dry_run": True})
+    assert call(gateway, "memory_graph", {"namespace": "team"})["result"]["total"] == 2
+    # ...but they still delete their own, unprotected memories
+    own = call(gateway, "memory_store", {"content": "my note", "namespace": "u-anna"})["result"]["id"]
+    assert call(gateway, "memory_delete", {"memory_id": own, "namespace": "u-anna"})["result"]["deleted"] is True
+    # the admin key deletes from the team's memory, and from a person's (somebody who left)
+    assert call(admin, "memory_delete", {"memory_id": mid, "namespace": "team"})["result"]["deleted"] is True
+    call(gateway, "memory_store", {"content": "ben's note", "namespace": "u-ben"})
+    assert call(admin, "memory_clear", {"namespace": "u-ben", "confirm": True})["result"]["deleted"] == 1
+    assert call(admin, "memory_clear", {"namespace": "team", "confirm": True})["result"]["deleted"] == 1
+    # an admin key must be one of the API keys
+    with pytest.raises(SystemExit):
+        SMCPServerConfig.from_env({"ZETTEL_SMCP_SECRET_KEY": SECRET, "ZETTEL_SMCP_API_KEY": API_KEY_A,
+                                   "ZETTEL_SMCP_ADMIN_KEYS": "some-other-key"})
+
+
 def test_limit_is_clamped(server, crypto):
     token = _auth(server, crypto, API_KEY_A)
     resp = _roundtrip(

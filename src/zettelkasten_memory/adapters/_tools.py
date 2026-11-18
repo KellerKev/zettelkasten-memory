@@ -260,6 +260,7 @@ def graph(
             "created_at": z.created_at,
             "accessed_at": z.accessed_at,
             "connections": len(z.connections),
+            "author": str((z.metadata or {}).get("author") or ""),
         }
 
     rows = [row(z) for z in nodes]
