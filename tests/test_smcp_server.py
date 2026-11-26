@@ -628,6 +628,49 @@ def test_caps_per_namespace_and_no_personal_data_in_a_protected_one(crypto):
     assert team["total"] == 2 and (team["cap"], team["when_full"]) == (2, "refuse")
 
 
+def test_document_namespaces_refuse_when_full_and_take_personal_data(crypto):
+    """A document namespace (`docs.`) accepts personal data and refuses rather than forgets
+    at its own cap; only an admin key may delete from it."""
+    from zettelkasten_memory.adapters import _tools
+
+    API_KEY_ADMIN = "api-key-admin"
+    config = SMCPServerConfig.from_env({
+        "ZETTEL_SMCP_SECRET_KEY": SECRET,
+        "ZETTEL_SMCP_API_KEYS": f"{API_KEY_A}=shared,{API_KEY_ADMIN}=shared",
+        "ZETTEL_SMCP_DELEGATE_KEYS": API_KEY_A,
+        "ZETTEL_SMCP_ADMIN_KEYS": API_KEY_ADMIN,
+        "ZETTEL_SMCP_DOCUMENT_NAMESPACES": "docs.",
+        "ZETTEL_SMCP_DOCUMENT_CAP": "2",
+        "ZETTEL_SMCP_JWT_SECRET": "an-independent-jwt-secret-of-enough-length",
+    })
+    srv = ZettelSMCPServer(_tools.build_memory(None), config)
+    gateway, admin = (_auth(srv, crypto, k) for k in (API_KEY_A, API_KEY_ADMIN))
+
+    def call(token, tool, params):
+        return _roundtrip(
+            srv, crypto, "tool_invoke",
+            {"token": token, "tool_name": tool, "parameters": params},
+        )["payload"]
+
+    # personal data is accepted (documents contain it; the gateway masks it downstream)
+    out = call(gateway, "memory_store",
+               {"content": "client anna@example.com owes €500", "namespace": "docs.a"})["result"]
+    assert "error" not in out
+    mid = out["id"]
+    # a person's ordinary namespace still forgets, so it is NOT a document namespace
+    assert call(gateway, "memory_stats", {"namespace": "docs.a"})["result"]["when_full"] == "refuse"
+    # fill it: refused, nothing dropped
+    call(gateway, "memory_store", {"content": "second chunk", "namespace": "docs.a"})
+    err = call(gateway, "memory_store", {"content": "third chunk", "namespace": "docs.a"})["error"]
+    assert "full" in err
+    stats = call(gateway, "memory_stats", {"namespace": "docs.a"})["result"]
+    assert stats["total_zettels"] == 2 and (stats["cap"], stats["when_full"]) == (2, "refuse")
+    # the gateway's agents cannot delete from it; the admin key can
+    err = call(gateway, "memory_delete", {"memory_id": mid, "namespace": "docs.a"})["error"]
+    assert "only the account's admins" in err
+    assert call(admin, "memory_delete", {"memory_id": mid, "namespace": "docs.a"})["result"]["deleted"] is True
+
+
 def test_limit_is_clamped(server, crypto):
     token = _auth(server, crypto, API_KEY_A)
     resp = _roundtrip(

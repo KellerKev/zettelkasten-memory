@@ -191,6 +191,7 @@ def search(
             "content": r.zettel.content,
             "score": round(r.score, 4),
             "tags": sorted(r.zettel.tags),
+            "metadata": dict(r.zettel.metadata or {}),
             "connections": len(r.zettel.connections),
         }
         for r in results

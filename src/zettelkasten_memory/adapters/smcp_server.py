@@ -39,6 +39,12 @@ All secrets come from environment variables (never CLI flags):
                              beyond it its own least valuable go (0 = no cap)
     ZETTEL_SMCP_PROTECTED_CAP  most memories a protected namespace takes; when
                              full a store is refused, nothing is dropped (0 = no cap)
+    ZETTEL_SMCP_DOCUMENT_NAMESPACES  comma-separated namespace prefixes (e.g.
+                             `docs.`): namespaces that hold indexed documents.
+                             They accept personal data (the gateway masks it
+                             before a model sees it) and, when full, refuse new
+                             stores rather than forget — nothing is dropped.
+    ZETTEL_SMCP_DOCUMENT_CAP  most memories a document namespace keeps (0 = no cap)
     ZETTEL_SMCP_HOST/PORT    bind address (default 127.0.0.1:8765)
     ZETTEL_SMCP_TOKEN_TTL    JWT lifetime seconds (default 3600)
     ZETTEL_SMCP_MAX_SKEW     accepted message-timestamp skew (default 300, 0=off)
@@ -130,11 +136,16 @@ class SMCPServerConfig:
     # Namespaces only an admin key may delete from: everybody stores and reads,
     # nobody's agent can empty what the whole team relies on.
     protected_namespaces: frozenset[str] = frozenset()
+    # Namespace prefixes that hold indexed documents (e.g. `docs.`). They accept
+    # personal data (the gateway masks it before a model sees it) and refuse rather
+    # than forget when full, so nothing silently disappears.
+    document_namespaces: frozenset[str] = frozenset()
     # Caps per namespace (0 = none). An ordinary namespace (a person's memory) forgets
     # its own least valuable memories beyond its cap; a protected one (a team's,
     # curated) refuses new ones instead, so nothing anybody relies on vanishes.
     namespace_cap: int = 0
     protected_cap: int = 0
+    document_cap: int = 0
     token_ttl: int = 3600
     max_skew: float = 300.0
     max_message_bytes: int = 1_048_576
@@ -201,6 +212,7 @@ class SMCPServerConfig:
             raise SystemExit("ZETTEL_SMCP_ADMIN_KEYS names a key that is not an API key")
         delegates = delegates | admins
         protected = frozenset(n.strip() for n in _env("PROTECTED_NAMESPACES", env).split(",") if n.strip())
+        documents = frozenset(p.strip() for p in _env("DOCUMENT_NAMESPACES", env).split(",") if p.strip())
         mode = _env("MODE", env)
         if mode and mode.lower() != "simple":
             raise SystemExit(
@@ -240,8 +252,10 @@ class SMCPServerConfig:
             delegate_keys=delegates,
             admin_keys=admins,
             protected_namespaces=protected,
+            document_namespaces=documents,
             namespace_cap=int(_env("NAMESPACE_CAP", env, "0") or 0),
             protected_cap=int(_env("PROTECTED_CAP", env, "0") or 0),
+            document_cap=int(_env("DOCUMENT_CAP", env, "0") or 0),
             token_ttl=int(_env("TOKEN_TTL", env, "3600")),
             max_skew=float(_env("MAX_SKEW", env, "300")),
             max_message_bytes=int(_env("MAX_MESSAGE_BYTES", env, str(1_048_576))),
@@ -458,7 +472,7 @@ class ZettelSMCPServer:
             return self._error(message["id"], f"Tool '{tool_name}' not found")
 
         if (
-            namespace in self.config.protected_namespaces
+            (namespace in self.config.protected_namespaces or self._is_document(namespace))
             and not claims.get("adm")
             and _deletes(tool_name, parameters)
         ):
@@ -478,11 +492,17 @@ class ZettelSMCPServer:
             {"tool_name": tool_name, "result": result, "status": "success"},
         )
 
+    def _is_document(self, namespace: str) -> bool:
+        """Whether `namespace` is a document namespace (matches a configured prefix)."""
+        return any(namespace.startswith(p) for p in self.config.document_namespaces)
+
     def _cap_of(self, namespace: str) -> dict[str, Any]:
         """How many memories this namespace may hold and what happens at the cap, for a
         viewer: {cap: 0 when there is none, when_full: "refuse" | "forget"}."""
         if namespace in self.config.protected_namespaces:
             return {"cap": self.config.protected_cap, "when_full": "refuse"}
+        if self._is_document(namespace):
+            return {"cap": self.config.document_cap, "when_full": "refuse"}
         return {"cap": self.config.namespace_cap, "when_full": "forget"}
 
     def _dispatch(
@@ -497,6 +517,7 @@ class ZettelSMCPServer:
             if author:
                 metadata["author"] = author
             protected = namespace in self.config.protected_namespaces
+            document = self._is_document(namespace)
             if protected:
                 # what everybody reads takes no personal data; a person's own memory may
                 text = " ".join(
@@ -517,6 +538,15 @@ class ZettelSMCPServer:
                         f"the team's memory is full ({cap:,} memories); nothing was stored. "
                         "Tell the user: the account's admins can delete what is out of date"
                     )
+            elif document:
+                # Indexed documents take personal data (the gateway masks it before any model
+                # sees it) but never forget: at the cap a store is refused, nothing is dropped.
+                cap = self.config.document_cap
+                if cap and mem.namespace_stats(namespace)["total_zettels"] >= cap:
+                    raise ValueError(
+                        f"this document space is full ({cap:,} chunks); nothing was stored. "
+                        "Tell the user: delete some documents to make room"
+                    )
             result = _tools.store(
                 mem,
                 str(params["content"]),
@@ -527,7 +557,7 @@ class ZettelSMCPServer:
                 params.get("search_text"),
                 namespace=namespace,
             )
-            if not protected and self.config.namespace_cap:
+            if not protected and not document and self.config.namespace_cap:
                 gone = mem.evict_namespace(namespace, self.config.namespace_cap)
                 if gone:
                     result["forgotten"] = gone
